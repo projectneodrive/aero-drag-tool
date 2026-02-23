@@ -41,7 +41,7 @@ python3 ./preconfigure.py --with-own-meson
 # ------------------------------
 ./meson.py setup build \
     --prefix=$HOME/su2-install \
-    -Dwith-mpi=disabled \
+    -Dwith-mpi=enabled \
     -Denable-pywrapper=true \
     --buildtype=release
 

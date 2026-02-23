@@ -4,7 +4,7 @@ import numpy as np
 import pyvista as pv
 import numpy as np
 
-resolution = 0.3
+resolution = 0.1
 V = 20.0
 rho = 1.225
 L = 1.0
@@ -109,7 +109,7 @@ CFL_ADAPT= YES
 CFL_ADAPT_PARAM= (0.1, 1.2, 10.0, 100.0)
 
 % ---------------------- Convergence ------------------------
-ITER= 2
+ITER= 1000
 
 CONV_RESIDUAL_MINVAL= -12
 CONV_STARTITER= 10
@@ -133,7 +133,7 @@ with open(cfg_file,"w") as f:
 # 3. Run solver
 # =========================
 # Use single process without mpirun first to isolate MPI errors
-subprocess.run(["SU2_CFD", cfg_file], check=True)
+subprocess.run(["mpirun", "-np", "16", "SU2_CFD", cfg_file], check=True)
 
 # =========================
 # 4. Extract drag
