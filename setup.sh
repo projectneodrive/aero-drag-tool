@@ -10,7 +10,8 @@ sudo apt install -y \
     swig \
     libopenblas-dev liblapack-dev libeigen3-dev \
     gfortran libglu1-mesa-dev freeglut3-dev mesa-common-dev \
-    libx11-dev libxt-dev pkg-config
+    libx11-dev libxt-dev pkg-config \
+    nvidia-cuda-toolkit
 
 # ------------------------------
 # 2. Create Python virtual environment
@@ -41,6 +42,7 @@ python3 ./preconfigure.py --with-own-meson
 # ------------------------------
 ./meson.py setup build \
     --prefix=$HOME/su2-install \
+    -Denable-cuda=true \
     -Dwith-mpi=enabled \
     -Denable-pywrapper=true \
     --buildtype=release

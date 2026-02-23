@@ -4,7 +4,7 @@ import numpy as np
 import pyvista as pv
 import numpy as np
 
-resolution = 0.1
+resolution = 0.5
 V = 20.0
 rho = 1.225
 L = 1.0
@@ -44,6 +44,8 @@ else:
 cfg = f"""
 % ---------------------------- Solver ----------------------------
 SOLVER= RANS
+GPU_DEVICE= 0
+
 KIND_TURB_MODEL= SST
 MATH_PROBLEM= DIRECT
 RESTART_SOL= NO
@@ -98,15 +100,15 @@ SLOPE_LIMITER_TURB= VENKATAKRISHNAN
 TIME_DISCRE_FLOW= EULER_IMPLICIT
 TIME_DISCRE_TURB= EULER_IMPLICIT
 
-LINEAR_SOLVER= FGMRES
+LINEAR_SOLVER= GPU_FGMRES
 LINEAR_SOLVER_PREC= ILU
 LINEAR_SOLVER_ERROR= 1E-6
 LINEAR_SOLVER_ITER= 10
 
 % ---------------------- CFL ------------------------
-CFL_NUMBER= 5.0
+CFL_NUMBER= 1.0
 CFL_ADAPT= YES
-CFL_ADAPT_PARAM= (0.1, 1.2, 10.0, 100.0)
+CFL_ADAPT_PARAM= (0.01, 0.5, 5.0, 50.0)
 
 % ---------------------- Convergence ------------------------
 ITER= 1000
