@@ -149,6 +149,7 @@ MARKER_HEATFLUX= (cube, 0.0)
 
 MARKER_MONITORING= (cube)
 MARKER_PLOTTING= (cube)
+MARKER_ANALYZE= (cube)
 
 NUM_METHOD_GRAD= GREEN_GAUSS
 
@@ -169,7 +170,7 @@ CFL_NUMBER= {CFL}
 CFL_ADAPT= YES
 CFL_ADAPT_PARAM= (0.5, 1.5, 1.0, 50.0)
 
-ITER= 1000
+ITER= 10
 
 CONV_RESIDUAL_MINVAL= -10
 CONV_STARTITER= 10
@@ -181,7 +182,7 @@ VOLUME_FILENAME= flow
 SURFACE_FILENAME= surface
 CONV_FILENAME= history
 
-HISTORY_OUTPUT= (ITER, RMS_RES, CD, CL, CMZ)
+HISTORY_OUTPUT= (ITER, RESIDUALS, AERO_COEFF, DRAG, LIFT, RMS_RES, CD, CL, CMZ, )
 """
 
 with open(cfg_file, "w") as f:
@@ -194,44 +195,4 @@ with open(cfg_file, "w") as f:
 subprocess.run(["mpirun", "-np", "16", "SU2_CFD", cfg_file], check=True)
 
 #subprocess.run(["SU2_CFD", cfg_file], check=True)
-# ============================================================
-# POSTPROCESS DRAG (UNCHANGED)
-# ============================================================
-
-surf = pv.read("surface.vtu")
-
-p = surf.point_data["Pressure"]
-points = surf.points
-cells = surf.cells
-celltypes = surf.celltypes
-
-F = np.zeros(3)
-
-for i, ct in enumerate(celltypes):
-
-    if ct != 5:
-        continue
-
-    offset = surf.offset[i]
-    tri = cells[offset+1:offset+4]
-
-    verts = points[tri]
-    tri_p = p[tri]
-
-    p_avg = np.mean(tri_p)
-
-    v0, v1, v2 = verts
-    nA = 0.5 * np.cross(v1 - v0, v2 - v0)
-
-    F += -p_avg * nA
-
-Drag = F[0]
-Lift = F[2]
-
-print("Force vector =", F)
-print("Drag =", Drag, "N")
-print("Lift =", Lift, "N")
-
-Cd = Drag / (0.5 * rho * V**2 * L**2)
-
-print("Cd =", Cd)
+s
