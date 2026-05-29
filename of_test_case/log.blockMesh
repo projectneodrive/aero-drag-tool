@@ -1,0 +1,74 @@
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  13
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+Build  : 13-441953dfbb42
+Exec   : blockMesh
+Date   : May 29 2026
+Time   : 11:14:13
+Host   : "Surface-NM"
+PID    : 1078
+I/O    : uncollated
+Case   : /mnt/c/Users/Nathann/ClawdDrive/Code/aero-drag-tool/of_test_case
+nProcs : 1
+sigFpe : Enabling floating point exception trapping (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 10)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Reading "blockMeshDict"
+
+Creating block mesh from
+    "system/blockMeshDict"
+Creating block edges
+No non-planar block faces defined
+Creating topology blocks
+Creating topology patches
+
+Creating block mesh topology
+
+Basic statistics
+    Number of internal faces : 0
+    Number of boundary faces : 6
+    Number of defined boundary faces : 6
+    Number of undefined boundary faces : 0
+
+Checking topology
+Creating block offsets
+Creating merge list .
+
+Creating polyMesh from blockMesh
+Creating patches
+Creating cells
+Creating points with scale 1
+    Block 0 cell size :
+        i : 0.225
+        j : 0.225
+        k : 0.225
+
+Writing polyMesh
+----------------
+Mesh Information
+----------------
+  boundingBox: (-4.5 -4.5 -4.5) (4.5 4.5 4.5)
+  nPoints: 68921
+  nCells: 64000
+  nFaces: 196800
+  nInternalFaces: 187200
+----------------
+Patches
+----------------
+  patch 0 (start: 187200 size: 1600) name: xmin
+  patch 1 (start: 188800 size: 1600) name: xmax
+  patch 2 (start: 190400 size: 1600) name: ymin
+  patch 3 (start: 192000 size: 1600) name: ymax
+  patch 4 (start: 193600 size: 1600) name: zmin
+  patch 5 (start: 195200 size: 1600) name: zmax
+
+End
+
