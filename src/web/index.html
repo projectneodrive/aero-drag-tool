@@ -22,160 +22,178 @@
     <span class="brand-name">Aero drag tool</span>
   </div>
 
-  <div class="scene-id">
-    <input id="scene-name" class="scene-name" type="text" placeholder="untitled" aria-label="Scene name" disabled>
-    <span id="scene-status" class="pill pill-muted">no scene</span>
-  </div>
-
   <div class="topbar-actions">
-    <button id="btn-sample" class="btn" data-sample="cube">Sample cube</button>
-    <button id="btn-sample-trike" class="btn" data-sample="trike">Sample trike</button>
+    <button class="btn" data-sample="cube">Sample cube</button>
+    <button class="btn" data-sample="trike">Sample trike</button>
     <label class="btn btn-file" for="file-stl">Import STL</label>
     <input id="file-stl" type="file" accept=".stl" hidden>
-    <label class="btn btn-file" for="file-scene">Import scene</label>
+    <label class="btn btn-file" for="file-scene">Open run file</label>
     <input id="file-scene" type="file" accept=".json" hidden>
     <button id="btn-library" class="btn">Library</button>
-    <button id="btn-save" class="btn" disabled>Save</button>
-    <button id="btn-download" class="btn" disabled>Download scene</button>
-    <button id="btn-download-stl" class="btn" disabled>Download hull STL</button>
+    <button id="btn-download" class="btn" disabled>Export run</button>
+    <button id="btn-download-stl" class="btn" disabled>Download STL</button>
   </div>
 </header>
 
+<!-- Every tab is one run: a shape, its parameters and its results. -->
+<nav class="tabbar" id="tabbar" aria-label="Open runs"></nav>
+
 <main class="layout">
 
-  <!-- ------------------------------------------------ scene controls -->
-  <aside class="panel panel-left" aria-label="Scene controls">
+  <!-- ------------------------------------------------ this run's inputs -->
+  <aside class="panel panel-left" id="panel-left" aria-label="Run parameters">
 
-    <section class="group">
-      <h2 class="group-title">Packaging</h2>
-      <div id="controls-packaging" class="controls"></div>
-      <p class="hint" id="fairing-hint">
-        The imported STL is what has to fit inside. <strong>Analyse packaging</strong>
-        sweeps a closing radius, proposes one fairing per stable topology, and
-        streamlines each into the smallest body whose tail stays attached.
-      </p>
-
-      <div id="sweep-block" hidden>
-        <h3 class="subhead">Bodies vs closing radius</h3>
-        <div class="sweep-wrap"><canvas id="sweep-chart"></canvas></div>
+    <div class="runhead" id="runhead" hidden>
+      <div class="runhead-top">
+        <input id="run-title" class="runhead-title" type="text" aria-label="Run title">
+        <span id="run-status" class="pill pill-draft">draft</span>
       </div>
+      <textarea id="run-description" class="runhead-desc" rows="2"
+                placeholder="What this run is for…" aria-label="Run description"></textarea>
+      <div class="lineage" id="run-lineage"></div>
+    </div>
 
-      <div id="candidate-list" class="candidate-list"></div>
-      <div id="fairing-warnings" class="warnings"></div>
+    <div class="group" id="freeze-block" hidden>
+      <p class="freeze-note">
+        Parameters are frozen until this run finishes — what you see is what the
+        solver was given. Open another tab to keep working.
+      </p>
+    </div>
+
+    <div class="group" id="changed-block" hidden>
+      <div class="note note-warn" id="changed-note"></div>
+    </div>
+
+    <section class="group" id="shape-block" hidden>
+      <h2 class="group-title">
+        <span id="shape-title">Shape</span>
+        <span class="pill pill-muted">fixed for this run</span>
+      </h2>
+      <dl class="factrow" id="shape-facts"></dl>
     </section>
 
-    <section class="group">
+    <section class="group" id="packaging-block" hidden>
+      <h2 class="group-title">Shape search</h2>
+      <div id="controls-packaging" class="controls"></div>
+      <p class="hint">
+        The shell is always <strong>one closed body</strong>. The sweep finds the
+        smallest closing radius that merges the payload into a single lump and
+        builds there — separate pods would leave a choked channel between them.
+      </p>
+    </section>
+
+    <section class="group param-block" hidden>
       <h2 class="group-title">Wind</h2>
       <div id="controls-wind" class="controls"></div>
       <p class="hint">Azimuth turns in the ground plane from +X toward +Y. Elevation tilts above it.</p>
     </section>
 
-    <section class="group">
-      <h2 class="group-title">Hull attitude</h2>
+    <section class="group param-block" hidden>
+      <h2 class="group-title">Attitude</h2>
       <div id="controls-orientation" class="controls"></div>
       <button id="btn-reset-attitude" class="btn btn-quiet btn-wide">Reset to zero</button>
     </section>
 
-    <section class="group">
+    <section class="group param-block" hidden>
       <h2 class="group-title">Road</h2>
       <div id="controls-road" class="controls"></div>
     </section>
 
-    <section class="group">
+    <section class="group param-block" hidden>
       <h2 class="group-title">Fluid</h2>
       <div id="controls-fluid" class="controls"></div>
     </section>
 
-    <section class="group">
-      <h2 class="group-title">Solvers</h2>
+    <section class="group param-block" id="solver-block" hidden>
+      <h2 class="group-title">Solver</h2>
+
+      <div class="control">
+        <label class="control-label" for="quality-select">Quality</label>
+        <select id="quality-select" class="control-select">
+          <option value="screening">Screening &mdash; fast</option>
+          <option value="balanced">Balanced</option>
+          <option value="accurate">Accurate &mdash; slow</option>
+        </select>
+      </div>
+
       <div id="solver-list" class="solver-list"></div>
-      <div id="controls-solver" class="controls"></div>
+
+      <div class="control">
+        <label class="control-label" for="processes-input">Parallel ranks</label>
+        <input id="processes-input" class="control-value" type="number" min="1" step="1" placeholder="auto">
+      </div>
+      <p class="hint" id="processes-hint"></p>
+
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <div id="controls-solver" class="controls"></div>
+      </details>
     </section>
   </aside>
 
-  <!-- ------------------------------------------------------ viewport -->
+  <!-- ---------------------------------------------------------- viewport -->
   <section class="viewport" aria-label="3D scene">
     <canvas id="view"></canvas>
 
     <div class="view-overlay view-overlay-top">
-      <div id="view-legend" class="view-legend">
-        <span class="key"><i class="swatch swatch-hull"></i>Hull</span>
-        <span class="key key-payload is-hidden"><i class="swatch swatch-payload"></i>Payload</span>
-        <span class="key"><i class="swatch swatch-wind"></i>Wind</span>
-        <span class="key key-road"><i class="swatch swatch-road"></i>Road</span>
-      </div>
-    </div>
-
-    <div class="view-overlay view-overlay-bottom">
-      <dl id="view-facts" class="facts"></dl>
+      <div id="view-legend" class="view-legend"></div>
     </div>
 
     <div id="view-empty" class="view-empty">
-      <p>No hull loaded.</p>
-      <p class="muted">Import an STL, import a scene file, or load the sample cube.</p>
+      <p class="view-empty-title">No runs open.</p>
+      <p class="muted">Import an STL, open a saved run, or load a sample to start one.</p>
     </div>
 
     <div class="view-hint">drag to orbit &middot; scroll to zoom &middot; right-drag to pan</div>
   </section>
 
-  <!-- ------------------------------------------------------- results -->
-  <aside class="panel panel-right" aria-label="Results">
+  <!-- ----------------------------------------------------------- results -->
+  <aside class="panel panel-right" id="panel-right" aria-label="Results">
 
-    <section class="group">
-      <h2 class="group-title">Run</h2>
-
-      <div class="control" id="quality-control">
-        <label class="control-label" for="quality-select">Quality</label>
-        <select id="quality-select" class="control-select">
-          <option value="screening">Screening &mdash; fast, for ranking</option>
-          <option value="balanced">Balanced</option>
-          <option value="accurate">Accurate &mdash; slow, for the winner</option>
-        </select>
-      </div>
-
-      <div class="control" id="processes-control">
-        <label class="control-label" for="processes-input">Parallel ranks</label>
-        <input id="processes-input" class="control-value" type="number" min="1" step="1" />
-        <p class="control-hint" id="processes-hint"></p>
-      </div>
-
-      <div class="run-row">
-        <button id="btn-analyze" class="btn btn-wide" disabled>Analyse packaging</button>
-        <button id="btn-compare" class="btn btn-wide" disabled>Compare designs</button>
-      </div>
-      <div class="run-row">
-        <button id="btn-run" class="btn btn-primary btn-wide" disabled>Compute drag</button>
-      </div>
-
+    <section class="group" id="progress-block" hidden>
+      <h2 class="group-title">Progress</h2>
       <div id="eta-line" class="eta"></div>
-      <div id="progress-bar" class="progress" hidden>
+      <div id="progress-bar" class="progress">
         <div id="progress-fill" class="progress-fill"></div>
       </div>
-      <p id="lock-note" class="lock-note" hidden>
-        Parameters are locked while the solver runs &mdash; the values on screen are
-        the ones being used.
-      </p>
-
-      <div id="reynolds-note" class="note note-info" hidden></div>
-      <div id="run-log" class="run-log" hidden></div>
+      <div id="run-log" class="run-log"></div>
     </section>
 
-    <section class="group">
-      <h2 class="group-title">Geometry</h2>
-      <div id="geometry-tiles" class="tiles"></div>
+    <section class="group" id="error-block" hidden>
+      <h2 class="group-title">Failed</h2>
+      <div id="error-text" class="note note-bad"></div>
     </section>
 
-    <section class="group" id="results-section" hidden>
-      <div class="meta-block">
-        <input id="result-title" class="meta-title" type="text" placeholder="Untitled computation"
-               aria-label="Computation title">
-        <textarea id="result-description" class="meta-description" rows="2"
-                  placeholder="Notes on this computation…" aria-label="Computation description"></textarea>
-        <div id="result-stamp" class="meta-stamp"></div>
+    <section class="group" id="empty-results" hidden>
+      <h2 class="group-title">Results</h2>
+      <div class="empty">
+        <p>Nothing solved in this run yet.</p>
+        <p class="muted" id="empty-results-hint">
+          Compute drag fills this panel in. The parameters on the left are the ones it will use.
+        </p>
       </div>
+    </section>
+
+    <!-- --------------------------------------------------- shape results -->
+    <section class="group" id="shell-block" hidden>
+      <h2 class="group-title">The shell</h2>
+      <div id="shell-tiles" class="tiles"></div>
+
+      <h3 class="subhead">Bodies vs closing radius</h3>
+      <div class="sweep-wrap"><canvas id="sweep-chart"></canvas></div>
+      <p class="hint" id="sweep-note"></p>
+
+      <button id="btn-adopt" class="btn btn-primary btn-wide">Open this shell as a run &rarr;</button>
+      <div id="shell-warnings" class="warnings"></div>
+    </section>
+
+    <!-- ---------------------------------------------------- drag results -->
+    <section class="group" id="results-block" hidden>
+      <h2 class="group-title">Results</h2>
+      <div id="result-tiles" class="tiles"></div>
 
       <div class="group-head">
-        <h2 class="group-title">Drag force over speed</h2>
+        <h3 class="subhead">Drag force over speed</h3>
         <div class="seg" role="group" aria-label="View as">
           <button id="btn-view-chart" class="seg-btn is-active" aria-pressed="true">Chart</button>
           <button id="btn-view-table" class="seg-btn" aria-pressed="false">Table</button>
@@ -202,29 +220,46 @@
 
       <div id="table-wrap" class="table-wrap" hidden></div>
 
-      <h3 class="subhead">Solver comparison</h3>
+      <h3 class="subhead">Per solver</h3>
       <div id="solver-tiles" class="tiles"></div>
 
-      <div id="ranking-block" hidden>
-        <h3 class="subhead">Design ranking</h3>
-        <div id="ranking-list" class="ranking"></div>
-      </div>
-
       <div id="result-warnings" class="warnings"></div>
+    </section>
+
+    <section class="group" id="geometry-block" hidden>
+      <h2 class="group-title">Geometry</h2>
+      <div id="geometry-tiles" class="tiles"></div>
+      <div id="reynolds-note" class="note note-info" hidden></div>
+    </section>
+
+    <section class="group" id="asrun-block" hidden>
+      <h2 class="group-title">As run</h2>
+      <div class="asrun" id="asrun-body"></div>
+      <div id="asrun-stamp" class="hint"></div>
     </section>
 
   </aside>
 </main>
 
-<!-- ------------------------------------------------------------ modal -->
+<!-- Two verbs, always the same two, always acting on the tab you are in. -->
+<footer class="actionbar" id="actionbar" hidden>
+  <div class="actionbar-buttons">
+    <button id="btn-compute" class="btn btn-primary btn-big">Compute drag</button>
+    <button id="btn-derive" class="btn btn-shape btn-big">Derive a lower-drag shape</button>
+  </div>
+  <div class="actionbar-text" id="actionbar-text"></div>
+  <div class="actionbar-right" id="actionbar-right"></div>
+</footer>
+
+<!-- ------------------------------------------------------------- modal -->
 <div id="library-modal" class="modal" hidden>
   <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="library-title">
-    <h2 id="library-title" class="modal-title">Scene library</h2>
+    <h2 id="library-title" class="modal-title">Run library</h2>
     <p class="hint" id="library-path"></p>
     <div id="library-list" class="library-list"></div>
     <div class="modal-actions">
       <input id="library-name" type="text" class="text-input" placeholder="filename">
-      <button id="btn-library-save" class="btn btn-primary">Save current</button>
+      <button id="btn-library-save" class="btn btn-primary">Save this run</button>
       <button id="btn-library-close" class="btn">Close</button>
     </div>
   </div>
