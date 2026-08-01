@@ -42,6 +42,9 @@ const CONTROL_SPECS = {
     { key: 'clearance', label: 'Payload clearance', unit: 'm', min: 0.005, max: 0.3, step: 0.005, decimals: 3 },
     { key: 'anisotropy', label: 'Streamwise bias', min: 1, max: 6, step: 0.1, decimals: 1 },
     { key: 'resolution', label: 'Voxel resolution', min: 48, max: 220, step: 4, decimals: 0 },
+    { key: 'streamline', label: 'Streamline the skin', type: 'check' },
+    { key: 'nose_angle_deg', label: 'Nose angle limit', unit: '°', min: 20, max: 70, step: 1, decimals: 0 },
+    { key: 'tail_angle_deg', label: 'Tail taper limit', unit: '°', min: 6, max: 25, step: 1, decimals: 0 },
   ],
   solver: [
     { key: 'reference_speed', label: 'Reference speed', unit: 'm/s', min: 1, max: 60, step: 0.5, decimals: 2 },
@@ -640,6 +643,44 @@ function renderSolverList() {
       updateRunButton();
     });
   }
+}
+
+/* Re-probe the backends. Worth doing after the rank count changes, because
+   each solver reports the count it will actually run with. */
+async function refreshSolvers() {
+  try {
+    const payload = await api('/api/solvers');
+    state.solvers = payload.solvers;
+    state.cores = payload.cores || null;
+  } catch (error) {
+    return;
+  }
+  renderSolverList();
+  renderProcesses();
+}
+
+function renderProcesses() {
+  const input = $('processes-input');
+  const hint = $('processes-hint');
+  const cores = state.cores;
+  if (!cores) {
+    input.disabled = true;
+    hint.textContent = '';
+    return;
+  }
+
+  input.disabled = !state.scene;
+  input.max = cores.available;
+
+  // An empty field is the default state, not a missing value: leaving it blank
+  // is what makes the scene portable to a machine with a different core count.
+  const pinned = state.scene ? state.scene.solver.processes : cores.processes;
+  input.value = pinned == null ? '' : pinned;
+  input.placeholder = cores.default_processes;
+
+  hint.textContent = pinned == null
+    ? `Auto: ${cores.default_processes} of ${cores.available} cores (80%). Set a number to pin it.`
+    : `Pinned to ${pinned} of ${cores.available} cores. Clear the field to go back to auto.`;
 }
 
 function updateRunButton() {
@@ -1319,6 +1360,9 @@ function renderCandidates() {
     const metrics = document.createElement('div');
     metrics.className = 'candidate-metrics';
     const parts = [`r = ${Math.round(candidate.radius * 1000)} mm`];
+    if (candidate.streamlined && candidate.tail_angle_deg) {
+      parts.push(`tail ${Math.round(candidate.tail_angle_deg)}°`);
+    }
     if (candidate.min_gap) parts.push(`gap ${Math.round(candidate.min_gap * 1000)} mm`);
     if (candidate.volume) parts.push(`${fixed(candidate.volume, 2)} m³`);
     metrics.textContent = parts.join(' · ');
@@ -1469,7 +1513,7 @@ function renderEta() {
 function setInputsLocked(locked) {
   const targets = document.querySelectorAll(
     '.panel-left input, .panel-left select, .panel-left button, '
-    + '#quality-select, #solver-list input, #btn-library, #btn-save',
+    + '#quality-select, #processes-input, #solver-list input, #btn-library, #btn-save',
   );
   for (const element of targets) {
     if (locked) {
@@ -1548,6 +1592,7 @@ function adoptScene(payload, options = {}) {
 
   if (!options.skipControls) applyControls(state.scene);
   $('quality-select').value = state.scene.solver.quality || 'balanced';
+  renderProcesses();
   $('scene-name').value = state.scene.name;
   $('scene-name').disabled = false;
   $('btn-save').disabled = false;
@@ -1819,6 +1864,25 @@ function wire() {
     } catch (error) { toast(error.message, true); }
   });
 
+  $('processes-input').addEventListener('change', async (event) => {
+    // Blank means "decide from this machine" rather than zero ranks, so it is
+    // sent through as null and the server clears the override.
+    const raw = event.target.value.trim();
+    const processes = raw === '' ? null : Number(raw);
+    try {
+      const payload = await api('/api/processes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ processes }),
+      });
+      adoptScene(payload);
+      await refreshSolvers();
+    } catch (error) {
+      toast(error.message, true);
+      renderProcesses();
+    }
+  });
+
   $('btn-download').addEventListener('click', () => { window.location.href = '/api/scene/download'; });
   $('btn-download-stl').addEventListener('click', () => { window.location.href = '/api/scene/hull.stl'; });
 
@@ -1897,10 +1961,13 @@ async function boot() {
   try {
     const payload = await api('/api/solvers');
     state.solvers = payload.solvers;
+    state.cores = payload.cores || null;
   } catch (error) {
     state.solvers = [];
+    state.cores = null;
   }
   renderSolverList();
+  renderProcesses();
 
   try {
     const payload = await api('/api/scene');

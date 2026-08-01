@@ -51,7 +51,8 @@
       <div id="controls-packaging" class="controls"></div>
       <p class="hint" id="fairing-hint">
         The imported STL is what has to fit inside. <strong>Analyse packaging</strong>
-        sweeps a closing radius and proposes one fairing per stable topology.
+        sweeps a closing radius, proposes one fairing per stable topology, and
+        streamlines each into the smallest body whose tail stays attached.
       </p>
 
       <div id="sweep-block" hidden>
@@ -130,6 +131,12 @@
           <option value="balanced">Balanced</option>
           <option value="accurate">Accurate &mdash; slow, for the winner</option>
         </select>
+      </div>
+
+      <div class="control" id="processes-control">
+        <label class="control-label" for="processes-input">Parallel ranks</label>
+        <input id="processes-input" class="control-value" type="number" min="1" step="1" />
+        <p class="control-hint" id="processes-hint"></p>
       </div>
 
       <div class="run-row">

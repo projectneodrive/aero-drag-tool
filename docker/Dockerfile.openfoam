@@ -1,0 +1,57 @@
+# OpenFOAM 13, the OpenFOAM *Foundation* build (openfoam.org).
+#
+# The fork matters. This tool drives `foamRun -solver incompressibleFluid` and
+# writes Foundation dictionary names (momentumTransport, physicalProperties).
+# The ESI build (openfoam.com, opencfd/* images) has no foamRun at all and
+# spells those dictionaries differently, so it is not a drop-in substitute.
+#
+# The Foundation publishes images only up to openfoam11, so there is no v13
+# tag to pull -- we install from their apt repository instead, which also lets
+# the version be pinned explicitly rather than tracking a rolling `-dev` tag.
+#
+# CPU only, deliberately: OpenFOAM's GPU paths (PETSc4FOAM, AmgX) live on the
+# ESI fork, accelerate only the linear solve, and want meshes an order of
+# magnitude larger than this tool generates. snappyHexMesh has no GPU path at
+# all. Cores are the lever; see execution.default_processes.
+
+FROM ubuntu:24.04
+
+ARG OPENFOAM_VERSION=13
+ARG UBUNTU_CODENAME=noble
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+    && curl -fsSL https://dl.openfoam.org/gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/openfoam.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/openfoam.gpg] http://dl.openfoam.org/ubuntu ${UBUNTU_CODENAME} main" \
+        > /etc/apt/sources.list.d/openfoam.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends "openfoam${OPENFOAM_VERSION}" \
+    && rm -rf /var/lib/apt/lists/*
+
+# The backend sources this explicitly before every command, so the path has to
+# match openfoam.OPENFOAM_BASHRC. Sourcing it here as well means an interactive
+# `docker run -it ... bash` lands in a usable environment too.
+ENV FOAM_BASHRC=/opt/openfoam${OPENFOAM_VERSION}/etc/bashrc
+RUN printf '. %s\n' "$FOAM_BASHRC" > /etc/profile.d/openfoam.sh \
+    && printf '. %s\n' "$FOAM_BASHRC" >> /etc/bash.bashrc
+
+# Runs bind-mounted here by execution.Runner. Declared so an interactive shell
+# starts in the right place.
+WORKDIR /case
+
+# OpenMPI refuses to start as root without this, and the container's default
+# user is root. The mpirun call also passes --allow-run-as-root; belt and
+# braces, because the tool may run the container as the host user instead.
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
+# Bind-mounted cases are small-file heavy; a writable HOME keeps OpenFOAM from
+# trying to write into a read-only root when run as a non-root host user.
+ENV HOME=/tmp
+
+CMD ["bash"]

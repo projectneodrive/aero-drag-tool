@@ -298,6 +298,15 @@ body {
   padding: 3px 6px;
 }
 
+/* Spans both columns so it sits under the label and its input, not beside. */
+.control-hint {
+  grid-column: 1 / -1;
+  margin: 1px 0 0;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
 /* ------------------------------------------------------------ solvers */
 
 .solver-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }

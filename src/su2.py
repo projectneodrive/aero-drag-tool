@@ -18,8 +18,9 @@ coefficients ``(CFx, CFy, CFz)`` onto the wind direction. That sidesteps any
 ambiguity about how SU2 orients its own lift/drag axes for an arbitrary wind.
 
 Mesh generation runs locally through the gmsh Python module on any platform.
-The solver itself runs natively when ``SU2_CFD`` is on PATH, otherwise through
-WSL, including the ``~/su2-install/bin`` location that ``setup.sh`` produces.
+The solver itself runs wherever :mod:`execution` finds it: natively when
+``SU2_CFD`` is on PATH, in a pinned Docker image, or through WSL -- including
+the ``~/su2-install/bin`` location that ``setup.sh`` produces.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+import execution as execution_env
+from execution import Runner
 from metrics import flow_domain, frontal_area, normalize
 
 
@@ -45,20 +48,8 @@ WSL_DISTRO = "Ubuntu-22.04"
 # past the non-interactive early return, so a non-interactive shell will not
 # see it and we have to look here explicitly.
 WSL_SU2_BIN = "$HOME/su2-install/bin"
-
-
-@dataclass
-class Execution:
-    """How to invoke SU2 on this machine."""
-
-    mode: str  # "native" or "wsl"
-    executable: str = "SU2_CFD"
-    processes: int = 1
-
-    def describe(self) -> str:
-        where = "PATH" if self.mode == "native" else f"WSL {WSL_DISTRO}"
-        parallel = f", {self.processes} processes" if self.processes > 1 else ""
-        return f"{self.executable} via {where}{parallel}"
+# The container puts SU2 on PATH through its own ENV, so no preamble is needed.
+CONTAINER_SU2_BIN = "/opt/su2/bin"
 
 
 def _wsl_bash(script: str, check: bool = True, capture_output: bool = True, timeout: int | None = None):
@@ -76,12 +67,28 @@ def _wsl_path(path: str | Path) -> str:
     return completed.stdout.strip()
 
 
-def detect_su2(processes: int = 1) -> Execution | None:
-    """Find a usable SU2_CFD, natively or in WSL. Returns None if absent."""
+def _native_runner(processes: int) -> Runner | None:
     native = shutil.which("SU2_CFD")
-    if native:
-        return Execution(mode="native", executable=native, processes=processes)
+    if not native:
+        return None
+    return Runner(mode="native", processes=processes, executable=native, label="SU2_CFD")
 
+
+def _docker_runner(processes: int) -> Runner | None:
+    image = execution_env.SU2_IMAGE
+    if not execution_env.docker_available() or not execution_env.image_present(image):
+        return None
+    return Runner(
+        mode="docker",
+        processes=processes,
+        image=image,
+        executable="SU2_CFD",
+        preamble=f"export PATH={CONTAINER_SU2_BIN}:$PATH",
+        label="SU2_CFD",
+    )
+
+
+def _wsl_runner(processes: int) -> Runner | None:
     try:
         probe = _wsl_bash(
             f"command -v SU2_CFD || (test -x {WSL_SU2_BIN}/SU2_CFD && echo {WSL_SU2_BIN}/SU2_CFD)",
@@ -90,10 +97,35 @@ def detect_su2(processes: int = 1) -> Execution | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-
     found = probe.stdout.strip().splitlines()
-    if probe.returncode == 0 and found:
-        return Execution(mode="wsl", executable=found[-1].strip(), processes=processes)
+    if probe.returncode != 0 or not found:
+        return None
+    return Runner(
+        mode="wsl",
+        processes=processes,
+        distro=WSL_DISTRO,
+        executable=found[-1].strip(),
+        preamble=f"export PATH={WSL_SU2_BIN}:$PATH",
+        label="SU2_CFD",
+    )
+
+
+_PROBES = {"native": _native_runner, "docker": _docker_runner, "wsl": _wsl_runner}
+
+
+def detect_su2(processes: int | None = None) -> Runner | None:
+    """Find a usable SU2_CFD. Returns None if there is none.
+
+    Order is native, Docker, WSL -- fastest first, then the reproducible one,
+    then the legacy install. ``AERO_EXECUTION`` pins a single mode instead.
+    """
+    count = execution_env.resolve_processes(processes)
+    forced = execution_env.forced_mode()
+    order = [forced] if forced else list(execution_env.MODES)
+    for mode in order:
+        runner = _PROBES[mode](count)
+        if runner is not None:
+            return runner
     return None
 
 
@@ -634,28 +666,28 @@ def prepare_su2_case(
     }
 
 
-def _run_su2_command(case_dir: Path, execution: Execution) -> Path:
+def _run_su2_command(case_dir: Path, runner: Runner) -> Path:
     log_path = case_dir / "log.su2"
 
-    if execution.mode == "native":
-        if execution.processes > 1 and shutil.which("mpirun"):
-            command = ["mpirun", "-np", str(execution.processes), execution.executable, "case.cfg"]
+    if runner.mode == "native":
+        # Kept off the bash path: a native install need not have a shell that
+        # understands -lc, and this already worked.
+        if runner.processes > 1 and shutil.which("mpirun"):
+            command = ["mpirun", "-np", str(runner.processes), runner.executable, "case.cfg"]
         else:
-            command = [execution.executable, "case.cfg"]
+            command = [runner.executable, "case.cfg"]
         with log_path.open("w", encoding="utf-8") as handle:
             subprocess.run(command, cwd=case_dir, stdout=handle, stderr=subprocess.STDOUT, check=False)
         return log_path
 
-    wsl_dir = _wsl_path(case_dir)
-    binary = shlex.quote(execution.executable)
-    if execution.processes > 1:
-        inner = f"mpirun -np {execution.processes} {binary} case.cfg"
+    binary = shlex.quote(runner.executable)
+    if runner.processes > 1:
+        # --allow-run-as-root is harmless outside a container and required
+        # inside one, where the build user is root.
+        inner = f"mpirun -np {runner.processes} --allow-run-as-root {binary} case.cfg"
     else:
         inner = f"{binary} case.cfg"
-    script = (
-        f"export PATH={WSL_SU2_BIN}:$PATH && cd {shlex.quote(wsl_dir)} && {inner} > log.su2 2>&1"
-    )
-    _wsl_bash(script, check=False, capture_output=True)
+    runner.bash(f"{inner} > log.su2 2>&1", case_dir=case_dir, check=False, capture_output=True)
     return log_path
 
 
@@ -671,14 +703,15 @@ def run_su2_drag(
     iterations: int = 400,
     surface_cells: int = 25,
     refinement_level: int = 3,
-    processes: int = 1,
+    processes: int | None = None,
     reference_area: float | None = None,
 ) -> SU2Result:
-    execution = detect_su2(processes=processes)
-    if execution is None:
+    runner = detect_su2(processes=processes)
+    if runner is None:
         raise RuntimeError(
-            "SU2_CFD was not found on PATH or in WSL. Save the scene and compute it on a "
-            "machine with SU2 installed (see runner.py), or install SU2 with setup.sh."
+            "SU2_CFD was not found on PATH, in Docker or in WSL. Build the container "
+            "image (docker/build.sh), install SU2 with setup.sh, or save the scene and "
+            "compute it on a machine that has SU2 (see runner.py)."
         )
 
     wind_vector = np.asarray(wind_vector, dtype=float)
@@ -706,7 +739,7 @@ def run_su2_drag(
         reference_area=reference_area,
     )
 
-    log_path = _run_su2_command(case_dir, execution)
+    log_path = _run_su2_command(case_dir, runner)
     log_text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.exists() else ""
     excerpt = "\n".join(log_text.splitlines()[-25:])
 
@@ -745,7 +778,7 @@ def run_su2_drag(
             "surface_cells": surface_cells,
             "cells": setup.get("cell_count"),
             "nodes": setup.get("node_count"),
-            "execution": execution.describe(),
+            "execution": runner.describe(),
         },
     )
 

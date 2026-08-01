@@ -48,16 +48,17 @@ class SolverInfo:
         }
 
 
-def _openfoam_info() -> SolverInfo:
+def _openfoam_info(processes: int | None = None) -> SolverInfo:
     try:
-        from openfoam import OPENFOAM_BASHRC, WSL_DISTRO, openfoam_available
+        from openfoam import detect_openfoam
 
-        available = openfoam_available()
+        runner = detect_openfoam(processes)
         detail = (
-            f"OpenFOAM 13 in WSL {WSL_DISTRO}"
-            if available
-            else f"Not found ({OPENFOAM_BASHRC} in WSL {WSL_DISTRO})"
+            runner.describe()
+            if runner is not None
+            else "OpenFOAM 13 not found natively, in Docker or in WSL. Build the image with docker/build.sh."
         )
+        available = runner is not None
     except Exception as error:  # pragma: no cover - import/env dependent
         available, detail = False, f"Unavailable: {error}"
     return SolverInfo(
@@ -69,18 +70,18 @@ def _openfoam_info() -> SolverInfo:
     )
 
 
-def _su2_info() -> SolverInfo:
+def _su2_info(processes: int | None = None) -> SolverInfo:
     try:
         from su2 import detect_su2, gmsh_available
 
-        execution = detect_su2()
-        if execution is None:
-            detail = "SU2_CFD not on PATH or in WSL. Save the scene and compute it elsewhere."
+        runner = detect_su2(processes)
+        if runner is None:
+            detail = "SU2_CFD not found natively, in Docker or in WSL. Build the image with docker/build.sh."
         elif not gmsh_available():
             detail = "SU2_CFD found but the gmsh module is missing (pip install gmsh)."
         else:
-            detail = execution.describe()
-        available = execution is not None and gmsh_available()
+            detail = runner.describe()
+        available = runner is not None and gmsh_available()
     except Exception as error:  # pragma: no cover - import/env dependent
         available, detail = False, f"Unavailable: {error}"
     return SolverInfo(name="su2", label="SU2", available=available, detail=detail, kind="cfd")
@@ -89,8 +90,8 @@ def _su2_info() -> SolverInfo:
 SOLVER_NAMES = ("openfoam", "su2")
 
 
-def available_solvers() -> list[SolverInfo]:
-    return [_openfoam_info(), _su2_info()]
+def available_solvers(processes: int | None = None) -> list[SolverInfo]:
+    return [_openfoam_info(processes), _su2_info(processes)]
 
 
 def solver_info(name: str) -> SolverInfo:
@@ -138,6 +139,7 @@ def _solve_openfoam(
         mesh_resolution=scene.solver.mesh_resolution,
         refinement_level=scene.solver.refinement_level,
         moving_ground=scene.road.enabled and scene.road.moving,
+        n_processors=scene.solver.processes,
         reference_area=reference_area,
     )
     return PointSolution(
@@ -172,6 +174,7 @@ def _solve_su2(
         iterations=scene.solver.iterations,
         surface_cells=max(scene.solver.mesh_resolution // 2, 8),
         refinement_level=scene.solver.refinement_level,
+        processes=scene.solver.processes,
         reference_area=reference_area,
     )
     return PointSolution(

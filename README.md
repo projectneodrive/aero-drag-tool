@@ -35,8 +35,9 @@ fairing has to enclose.
 The shortest path to a hull:
 
 1. **Import STL** — whatever has to fit inside: rider, wheels, battery.
-2. **Analyse packaging** — sweeps a closing radius and proposes one fairing per
-   stable topology, each verified to enclose the payload.
+2. **Analyse packaging** — sweeps a closing radius, proposes one fairing per
+   stable topology, and streamlines each into the smallest taper-bounded body
+   that encloses the payload (verified with a real containment test).
 3. **Compare designs** — runs every candidate through the solvers at the
    screening preset and ranks them by drag area.
 4. The winner is selected for you, with its own drag curve. Switch to
@@ -78,6 +79,34 @@ The clearance counts in the sweep too. Offsetting the skin outward is itself a
 dilation, so it merges any bodies closer than twice the clearance -- which means
 the topology worth counting is the skin's, not the closed set's. Count the
 closed set and the tool proposes candidates the builder cannot actually make.
+
+### From packaging skin to a body you would fly
+
+The closing decides *topology*, never *profile*: it is bounded by the convex
+hull, so on a convex payload it does nothing at all, and the skin would come
+out as the payload plus clearance — a rounded cube for a cube. Nothing in
+"wrap this as tightly as possible" ever grows a tail, because a tail is volume
+the payload does not need.
+
+So a second stage grows one deliberately. Each candidate skin is the **minimal
+taper-bounded envelope** of its closed set: the smallest body whose
+cross-sections never grow steeper than the nose angle (45° by default) and
+never shrink steeper than the tail angle (12°) along the flow. Those two
+limits are the whole of classical streamlining — a tail shallow enough to keep
+the boundary layer attached, a nose that may be blunt because accelerating
+flow forgives almost anything — and the minimal body satisfying them is
+computed exactly, per voxel slice, from running distance fields. A cube in, a
+teardrop out: fineness ratio ~3.7, frontal area unchanged, with the tail
+length set by the taper limit rather than by taste.
+
+The envelope also fairs in-line bodies into each other automatically — the
+leading body's tail cone reaches the trailing body's nose — which is why the
+component count is recounted from the built mesh rather than trusted from the
+plateau. What the taper limit *costs* (wetted area, hence friction) versus
+what it saves (pressure drag) is not decided here: that is exactly the
+question the Cd·A comparison answers. Tweak the angles or disable the stage
+entirely (`--no-streamline`, or the packaging checkbox in the GUI) to see the
+difference in numbers.
 
 **Ranking is by Cd·A, not Cd.** On a mock rider-and-wheels payload the merged
 shell posts the *lowest* Cd (0.603 against 0.623) and still loses, because its
@@ -172,13 +201,115 @@ each with an `Allrun` script.
 
 | Backend | What it runs | Where |
 |---|---|---|
-| `openfoam` | blockMesh → snappyHexMesh → `foamRun -solver incompressibleFluid`, drag from a `forceCoeffs` function object | OpenFOAM 13 in WSL `Ubuntu-22.04` |
-| `su2` | gmsh volume mesh → `SU2_CFD` incompressible RANS, drag from the force coefficients projected onto the wind | `SU2_CFD` on PATH, or in WSL (including `~/su2-install/bin`) |
+| `openfoam` | blockMesh → snappyHexMesh → `foamRun -solver incompressibleFluid`, drag from a `forceCoeffs` function object | OpenFOAM 13, in Docker or in WSL `Ubuntu-22.04` |
+| `su2` | gmsh volume mesh → `SU2_CFD` incompressible RANS, drag from the force coefficients projected onto the wind | `SU2_CFD` in Docker, on PATH, or in WSL (including `~/su2-install/bin`) |
 
 There is deliberately no analytical backend. `0.5 ρ V² A Cd` needs you to supply
 the Cd, which is the number the tool exists to find — it can only ever echo an
 assumption back. The half of it that *is* knowable without a solver, the frontal
 area, is shown in the Geometry panel already.
+
+### Where the solvers run
+
+Both backends already ran their solver as an external process in a Linux
+environment reached through a shim; WSL was simply the only shim. `src/execution.py`
+makes it a choice, probed in this order:
+
+| Mode | When it wins |
+|---|---|
+| `native` | the solver is on `PATH` — no virtualisation layer, so fastest |
+| `docker` | a pinned image is built — reproducible, and the case mounts at `/case` |
+| `wsl` | an existing WSL install — the original path, still supported |
+
+`AERO_EXECUTION=docker` pins one mode instead of probing. `python src/runner.py info`
+prints which one each backend resolved to.
+
+### Containers
+
+```bash
+./docker/build.sh          # both images; .\docker\build.ps1 on Windows
+python src/runner.py info  # confirm they were picked up
+```
+
+Two images, because the two solvers share no useful base:
+
+- **OpenFOAM** installs v13 from the Foundation's apt repository. There is no
+  official v13 image to pull — [hub.docker.com/u/openfoam](https://hub.docker.com/u/openfoam)
+  stops at `openfoam11` plus a rolling `-dev` — and installing from apt pins the
+  version explicitly instead. The **Foundation** build (openfoam.org) is required:
+  the ESI build (openfoam.com, `opencfd/*`) has no `foamRun` at all and spells
+  `momentumTransport` / `physicalProperties` differently.
+- **SU2** compiles 8.4.0 from source with MPI. The precompiled binaries from the
+  download page have parallel support explicitly disabled, and this tool
+  dispatches through `mpirun`, so downloading them would silently cost every
+  core. `-Denable-cuda` and `-Denable-pywrapper` from `setup.sh` are dropped:
+  nothing imports `pysu2`, and see below on GPUs. It is a multi-stage build, so
+  the toolchain does not ship in the final image.
+
+On Windows, keep case directories off `C:\` bind mounts — they cross the 9p
+filesystem boundary, which is slow at exactly this workload (snappyHexMesh
+writes hundreds of thousands of small files). A named volume or a path inside
+the WSL2 filesystem is much faster.
+
+### Why the containers are CPU-only
+
+Not an oversight. OpenFOAM's GPU paths (PETSc4FOAM, AmgX) live on the ESI fork,
+not the Foundation build this tool drives; adopting them means porting the whole
+backend and re-validating every Cd. They accelerate only the linear solve, so
+Amdahl's law caps the win at roughly 1.5–2× — and only past ~1M cells, where the
+GPU has enough work to beat per-iteration transfer and launch latency. The
+largest case here is 0.27M. snappyHexMesh and gmsh have no GPU path at all, and
+the measurements in `runtime_history.json` say meshing and fixed overhead *are*
+the runtime: a 266k-cell/400-iteration solve came in at 9.7 s against 9–15 s for
+42k cells at 150 iterations.
+
+Cores are the lever that actually moves, which is what the next section is for.
+
+### Parallel ranks
+
+The solve runs on **80% of the cores visible to the tool** by default — not all
+of them, because the mesher, the GUI and the OS still need one, and an
+oversubscribed MPI run is slower than a correctly sized one.
+
+```bash
+python src/runner.py run case.aero.json                 # auto: 80% of cores
+python src/runner.py run case.aero.json --processes 12   # pin it
+python src/runner.py info                                # what it resolved to
+```
+
+In the GUI it is the **Parallel ranks** field under Run. Leave it blank for
+auto; type a number to pin it. `AERO_PROCESSES` overrides the default for a
+whole session.
+
+"Visible to the tool" is not "on the machine": CPU affinity and cgroup quotas
+both narrow it, and both are normal when the tool itself runs in a container.
+`execution.available_cores` reads `sched_getaffinity` and the cgroup v1/v2 CPU
+quota rather than trusting `os.cpu_count`.
+
+A scene stores the rank count only when you pin one, so a saved scene stays
+portable to a machine with a different core count. An explicit request is
+clamped to the cores that exist.
+
+Meshing is still serial — only the solve is decomposed. Running snappyHexMesh in
+parallel means `decomposePar` before it and either `reconstructParMesh` after or
+carrying the decomposed mesh into the solve, which changes the pipeline enough
+to need validating against known cases first.
+
+**Ranks do not pay off at screening size.** Measured on the sample cube, 42k
+cells, 150 iterations, OpenFOAM through WSL on an 8-core laptop:
+
+| Ranks | Wall time |
+|---|---|
+| 1 | 28.9 s |
+| 2 | 29.7 s |
+| 6 (the 80% default) | 37.8 s |
+
+More ranks is *slower*, because `decomposePar` and `reconstructPar` are serial
+and MPI startup is a fixed cost, while the solve itself is a few seconds of a
+run dominated by meshing and process startup. The crossover is somewhere above
+these mesh sizes — the accurate preset (resolution 60, refinement 4) generates
+far more cells, and that is where the ranks earn their keep. Pin `--processes 1`
+for screening sweeps until the crossover is measured on real fairings.
 
 ### Quality presets and run time
 
@@ -226,6 +357,17 @@ mean, the result is flagged as unconverged.
 
 ## Installing the solvers
 
+**Containers are the recommended route** — `./docker/build.sh` builds both, the
+versions are pinned rather than inherited from whatever the machine happens to
+have, and nothing lands on `PATH`. Requires Docker (Docker Desktop + WSL2 on
+Windows). See [Containers](#containers) above.
+
+The container also makes the offline split practical: design on a laptop, save
+the scene, and run `runner.py run` on a machine that has the images, without a
+second full install.
+
+### Installing natively instead
+
 `setup.sh` builds SU2 v8.4.0 (Ubuntu/Pop!_OS tested). OpenFOAM 13 is expected at
 `/opt/openfoam13` inside WSL `Ubuntu-22.04`; adjust `WSL_DISTRO` and
 `OPENFOAM_BASHRC` at the top of `src/openfoam.py` if yours lives elsewhere.
@@ -233,7 +375,11 @@ mean, the result is flagged as unconverged.
 Note that `setup.sh` appends its `PATH` export to the end of `~/.bashrc`, past
 the early return for non-interactive shells, so a non-interactive `bash -lc`
 will not see it. The SU2 backend therefore also probes `~/su2-install/bin`
-directly.
+directly. The containers do not have this problem: they set `PATH` through
+`ENV`, which a non-interactive shell does see.
+
+`setup.sh` also passes `-Denable-cuda`; the containers deliberately do not. See
+[Why the containers are CPU-only](#why-the-containers-are-cpu-only).
 
 ## Layout
 
@@ -248,6 +394,8 @@ directly.
 | `src/solvers.py` | Backend registry and the scale-vs-sweep orchestration |
 | `src/openfoam.py` | OpenFOAM case generation and run |
 | `src/su2.py` | SU2 case generation and run |
+| `src/execution.py` | Where the solvers run (native/Docker/WSL) and how many ranks they get |
+| `docker/` | Solver images and their build scripts |
 | `src/runner.py` | Command line: info / new / run / show / fair / compare / export |
 | `src/drag.py` | SU2-flavoured entry point into the same CLI |
 

@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 import estimates
 import fairing as fairing_module
 from scene import KNOWN_BACKENDS, FairingSpec, Geometry, ResultSet, Scene
+from execution import available_cores, default_processes
 from solvers import available_solvers, run_scene
 
 
@@ -254,7 +255,40 @@ def safe_scene_name(name: str) -> str:
 
 @app.get("/api/solvers")
 def get_solvers() -> dict:
-    return {"solvers": [info.to_dict() for info in available_solvers()]}
+    scene = state.get_optional()
+    processes = scene.solver.processes if scene is not None else None
+    return {
+        "solvers": [info.to_dict() for info in available_solvers(processes)],
+        "cores": {
+            "available": available_cores(),
+            "default_processes": default_processes(),
+            "processes": processes,
+        },
+    }
+
+
+@app.post("/api/processes")
+def set_processes(body: dict) -> dict:
+    """Pin the MPI rank count, or clear it back to the 80%-of-cores default."""
+    scene = state.get()
+    requested = body.get("processes")
+    if requested in (None, "", 0):
+        scene.solver.processes = None
+    else:
+        try:
+            count = int(requested)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail="processes must be a number") from error
+        if count < 1:
+            raise HTTPException(status_code=400, detail="processes must be at least 1")
+        if count > available_cores():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only {available_cores()} cores are visible here",
+            )
+        scene.solver.processes = count
+    state.set(scene, state.source_path)
+    return scene_payload(scene)
 
 
 @app.get("/api/scene")
@@ -374,6 +408,11 @@ def analyze_fairing(body: dict | None = None) -> dict:
     clearance = scene.packaging.clearance
     anisotropy = scene.packaging.anisotropy
     resolution = scene.packaging.resolution
+    streamline = (
+        (scene.packaging.nose_angle_deg, scene.packaging.tail_angle_deg)
+        if scene.packaging.streamline
+        else None
+    )
     limit = int(body.get("limit", 4))
     run_index, title = scene.next_title("packaging")
     scene.run_index = run_index
@@ -399,8 +438,11 @@ def analyze_fairing(body: dict | None = None) -> dict:
             )
 
             job.add_event({"phase": "build", "message": "Building the candidate fairings"})
+            # The skin grid gets the streamwise room the nose and tail cones
+            # need; the sweep grid above does not, since topology needs no tail.
             fine = fairing_module.build_grid(
-                payload_mesh, direction=direction, resolution=resolution, anisotropy=anisotropy
+                payload_mesh, direction=direction, resolution=resolution, anisotropy=anisotropy,
+                streamline=streamline, clearance=clearance,
             )
             candidates = fairing_module.candidates_from_sweep(
                 grid,
@@ -411,6 +453,7 @@ def analyze_fairing(body: dict | None = None) -> dict:
                 limit=limit,
                 progress=job.add_event,
                 build_grid_override=fine,
+                streamline=streamline,
             )
             # Most separate bodies first: that is the natural progression from
             # tight local pods to one merged shell.
@@ -466,6 +509,9 @@ def _select_candidate(scene: Scene, index: int) -> Scene:
         anisotropy=float((fairings.sweep or {}).get("anisotropy", fairing_module.DEFAULT_ANISOTROPY)),
         components=candidate.components,
         plateau_width=candidate.plateau_width,
+        streamlined=candidate.streamlined,
+        nose_angle_deg=candidate.nose_angle_deg,
+        tail_angle_deg=candidate.tail_angle_deg,
     )
     fairings.selected = index
     return updated

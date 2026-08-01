@@ -58,6 +58,17 @@ def _as_float(value: Any, default: float) -> float:
     return float(value)
 
 
+def _as_optional_int(value: Any) -> int | None:
+    """A positive int, or None for "unset". Zero and junk both read as unset."""
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 @dataclass
 class Orientation:
     """Hull attitude in degrees, applied about the mesh centroid as Rz*Ry*Rx."""
@@ -240,6 +251,11 @@ class SolverSettings:
     mesh_resolution: int = 40  # background cells along the longest domain axis
     refinement_level: int = 3  # surface refinement for snappyHexMesh / gmsh sizing
     quality: str = "balanced"
+    # MPI ranks for the solve. None means "decide from this machine", which is
+    # 80% of the visible cores -- see execution.default_processes. It is left
+    # unset rather than baked in so a scene stays portable between machines
+    # with different core counts.
+    processes: int | None = None
 
     def apply_preset(self, name: str) -> "SolverSettings":
         preset = QUALITY_PRESETS.get(name)
@@ -271,6 +287,7 @@ class SolverSettings:
             "mesh_resolution": self.mesh_resolution,
             "refinement_level": self.refinement_level,
             "quality": self.quality,
+            "processes": self.processes,
         }
 
     @classmethod
@@ -295,6 +312,9 @@ class SolverSettings:
             mesh_resolution=int(data.get("mesh_resolution") or defaults.mesh_resolution),
             refinement_level=int(data.get("refinement_level") or defaults.refinement_level),
             quality=str(data.get("quality") or defaults.quality),
+            # Absent and null both mean "decide from this machine"; only an
+            # explicit number pins the rank count into the scene.
+            processes=_as_optional_int(data.get("processes")),
         )
 
 
@@ -305,12 +325,21 @@ class PackagingSettings:
     clearance: float = 0.03
     anisotropy: float = 3.0
     resolution: int = 128
+    # The taper-bounded envelope: off means the raw closing skin, which merely
+    # encloses. The tail limit is what keeps the afterbody attached; the nose
+    # is forgiving and mostly sets how blunt the front may be.
+    streamline: bool = True
+    nose_angle_deg: float = 45.0
+    tail_angle_deg: float = 12.0
 
     def to_dict(self) -> dict:
         return {
             "clearance": self.clearance,
             "anisotropy": self.anisotropy,
             "resolution": self.resolution,
+            "streamline": self.streamline,
+            "nose_angle_deg": self.nose_angle_deg,
+            "tail_angle_deg": self.tail_angle_deg,
         }
 
     @classmethod
@@ -321,6 +350,9 @@ class PackagingSettings:
             clearance=_as_float(data.get("clearance"), defaults.clearance),
             anisotropy=_as_float(data.get("anisotropy"), defaults.anisotropy),
             resolution=int(data.get("resolution") or defaults.resolution),
+            streamline=bool(data.get("streamline", defaults.streamline)),
+            nose_angle_deg=_as_float(data.get("nose_angle_deg"), defaults.nose_angle_deg),
+            tail_angle_deg=_as_float(data.get("tail_angle_deg"), defaults.tail_angle_deg),
         )
 
 
@@ -335,6 +367,9 @@ class FairingSpec:
     plateau_width: float = 0.0
     resolution: int = 128
     smoothing: int = 12
+    streamlined: bool = False
+    nose_angle_deg: float | None = None
+    tail_angle_deg: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -345,6 +380,9 @@ class FairingSpec:
             "plateau_width": self.plateau_width,
             "resolution": self.resolution,
             "smoothing": self.smoothing,
+            "streamlined": self.streamlined,
+            "nose_angle_deg": self.nose_angle_deg,
+            "tail_angle_deg": self.tail_angle_deg,
         }
 
     @classmethod
@@ -359,6 +397,11 @@ class FairingSpec:
             plateau_width=_as_float(data.get("plateau_width"), 0.0),
             resolution=int(data.get("resolution") or 128),
             smoothing=int(data.get("smoothing") or 12),
+            streamlined=bool(data.get("streamlined", False)),
+            nose_angle_deg=None if data.get("nose_angle_deg") is None
+            else float(data["nose_angle_deg"]),
+            tail_angle_deg=None if data.get("tail_angle_deg") is None
+            else float(data["tail_angle_deg"]),
         )
 
 

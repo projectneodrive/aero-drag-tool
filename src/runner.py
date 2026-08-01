@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 from scene import Scene, Wind
+from execution import available_cores, default_processes
 from solvers import available_solvers, run_scene
 
 
@@ -75,6 +76,8 @@ def _apply_common_options(scene: Scene, args: argparse.Namespace) -> Scene:
         scene.solver.iterations = int(args.iterations)
     if getattr(args, "mesh_resolution", None) is not None:
         scene.solver.mesh_resolution = int(args.mesh_resolution)
+    if getattr(args, "processes", None) is not None:
+        scene.solver.processes = int(args.processes)
     if getattr(args, "solver", None):
         scene.solver.backends = list(args.solver)
     return scene
@@ -105,13 +108,26 @@ def _add_scene_options(parser: argparse.ArgumentParser) -> None:
     solving.add_argument("--turbulence", choices=["kOmegaSST", "laminar"], help="Turbulence model")
     solving.add_argument("--iterations", type=int, help="Solver iterations")
     solving.add_argument("--mesh-resolution", type=int, help="Background mesh resolution")
+    solving.add_argument(
+        "--processes",
+        type=int,
+        metavar="N",
+        help=(
+            f"MPI ranks for the solve (default {default_processes()}: "
+            f"80%% of the {available_cores()} cores visible here)"
+        ),
+    )
 
 
 def command_info(args: argparse.Namespace) -> int:
+    processes = getattr(args, "processes", None)
     print("Solver availability:\n")
-    for info in available_solvers():
+    for info in available_solvers(processes):
         mark = "yes" if info.available else "no "
         print(f"  [{mark}] {info.label:<12} {info.detail}")
+    print()
+    print(f"  cores visible : {available_cores()}")
+    print(f"  default ranks : {default_processes()} (80% of them; override with --processes)")
     print()
     return 0
 
@@ -301,6 +317,7 @@ def command_fair(args: argparse.Namespace) -> int:
 
     payload_mesh = scene.payload.raw_mesh()
     direction = scene.wind.direction()
+    streamline = None if args.no_streamline else (args.nose_angle, args.tail_angle)
 
     print(f"Voxelising {payload_path.name}")
     grid = fairing_module.build_grid(
@@ -310,7 +327,7 @@ def command_fair(args: argparse.Namespace) -> int:
     print(f"  grid {grid.occupancy.shape}, pitch {grid.pitch * 1000:.1f} mm")
 
     result = fairing_module.sweep(
-        grid, anisotropy=args.anisotropy,
+        grid, anisotropy=args.anisotropy, clearance=args.clearance,
         progress=lambda event: print(f"  {event['message']}"),
     )
     print("\nTopology plateaus (wider is a more robust design):")
@@ -321,14 +338,17 @@ def command_fair(args: argparse.Namespace) -> int:
             f"-> pick r = {plateau.radius * 1000:.0f} mm"
         )
 
+    # The skin grid gets the streamwise room the nose and tail cones need;
+    # the sweep grid above does not, since topology needs no tail.
     fine = fairing_module.build_grid(
-        payload_mesh, direction=direction, resolution=args.resolution, anisotropy=args.anisotropy
+        payload_mesh, direction=direction, resolution=args.resolution,
+        anisotropy=args.anisotropy, streamline=streamline, clearance=args.clearance,
     )
     candidates = fairing_module.candidates_from_sweep(
         grid, payload_mesh, result, direction=direction,
         clearance=args.clearance, limit=args.limit,
         progress=lambda event: print(f"  {event['message']}"),
-        build_grid_override=fine,
+        build_grid_override=fine, streamline=streamline,
     )
     candidates.sort(key=lambda item: -item.components)
 
@@ -348,6 +368,9 @@ def command_fair(args: argparse.Namespace) -> int:
             anisotropy=args.anisotropy,
             components=candidate.components,
             plateau_width=candidate.plateau_width,
+            streamlined=candidate.streamlined,
+            nose_angle_deg=candidate.nose_angle_deg,
+            tail_angle_deg=candidate.tail_angle_deg,
         )
         variant.name = f"{payload_path.stem}_{candidate.components}body"
         path = output_dir / f"{variant.name}.aero.json"
@@ -361,9 +384,14 @@ def command_fair(args: argparse.Namespace) -> int:
         if candidate.choked:
             flags.append(f"choked gap {candidate.min_gap * 1000:.0f} mm")
         suffix = f"  [{', '.join(flags)}]" if flags else ""
+        shape = (
+            f"streamlined, tail {candidate.tail_angle_deg:.0f} deg"
+            if candidate.streamlined
+            else "raw closing skin"
+        )
         print(
             f"{path}\n  {candidate.components} bodies, r = {candidate.radius * 1000:.0f} mm, "
-            f"frontal area {candidate.frontal_area:.4f} m^2{suffix}"
+            f"{shape}, frontal area {candidate.frontal_area:.4f} m^2{suffix}"
         )
 
     for warning in list(grid.warnings) + list(fine.warnings):
@@ -430,6 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     info = subparsers.add_parser("info", help="Show which solvers are usable here")
+    info.add_argument("--processes", type=int, metavar="N", help="Preview a specific rank count")
     info.set_defaults(handler=command_info)
 
     new = subparsers.add_parser("new", help="Create a scene file from an STL")
@@ -457,6 +486,18 @@ def build_parser() -> argparse.ArgumentParser:
     fair.add_argument("--anisotropy", type=float, default=3.0, help="Streamwise bias of the closing")
     fair.add_argument("--resolution", type=int, default=128, help="Voxel resolution for the skin")
     fair.add_argument("--limit", type=int, default=4, help="Maximum candidates to build")
+    fair.add_argument(
+        "--nose-angle", type=float, default=45.0,
+        help="Nose growth limit in degrees from the flow axis (blunter is shorter)",
+    )
+    fair.add_argument(
+        "--tail-angle", type=float, default=12.0,
+        help="Tail taper limit in degrees; much past 15 the afterbody separates",
+    )
+    fair.add_argument(
+        "--no-streamline", action="store_true",
+        help="Skip the taper-bounded envelope and emit the raw closing skin",
+    )
     _add_scene_options(fair)
     fair.set_defaults(handler=command_fair)
 
