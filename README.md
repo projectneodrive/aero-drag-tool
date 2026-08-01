@@ -73,7 +73,12 @@ Two things make it aerodynamic rather than merely geometric:
 
 The skin itself is the clearance level set of a signed distance field, so the
 payload gap is exact by construction and the surface is smooth to sub-voxel
-precision. Every candidate is then re-checked with a real containment test.
+precision. The field is Gaussian-filtered before the surface is extracted:
+distance fields computed from binary voxels carry staircase ripples at the
+pitch scale, and filtering the *field* removes them at the source — a Gaussian
+preserves linear fields exactly, so flat and gently curved regions do not move
+at all — where smoothing the extracted *mesh* could only polish triangle by
+triangle. Every candidate is then re-checked with a real containment test.
 
 The clearance counts in the sweep too. Offsetting the skin outward is itself a
 dilation, so it merges any bodies closer than twice the clearance -- which means

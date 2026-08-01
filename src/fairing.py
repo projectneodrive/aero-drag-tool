@@ -639,6 +639,7 @@ def build_fairing(
     anisotropy: float = DEFAULT_ANISOTROPY,
     smoothing_iterations: int = 12,
     streamline: tuple[float, float] | None = None,
+    field_sigma_voxels: float = 1.2,
 ) -> trimesh.Trimesh:
     """Build the fairing skin for one closing radius.
 
@@ -649,6 +650,16 @@ def build_fairing(
     With ``streamline`` set to a (nose, tail) angle pair, the closed set is
     replaced by its taper-bounded envelope first: same topology decision, but
     a profile shaped to fly rather than merely to enclose.
+
+    ``field_sigma_voxels`` smooths the distance *field*, not the mesh. The
+    field is computed from a binary mask, so its level sets carry staircase
+    ripples at the voxel pitch -- which is exactly the wavelength Taubin on
+    the extracted mesh is too local to remove. A Gaussian on the field kills
+    them at the source: it preserves linear fields exactly, so wherever the
+    surface is flat or gently curved the level set does not move at all, and
+    only features at the noise scale are touched. The sigma is capped well
+    below the extraction level so tight corners are rounded by millimetres,
+    never eaten; the containment check downstream still verifies the result.
     """
     mask = closed_mask(grid, radius, anisotropy, distance_outside=_ensure_distance(grid, anisotropy))
     if streamline is not None:
@@ -665,9 +676,20 @@ def build_fairing(
     # merges, not a distortion we want baked into the skin.
     outside = ndimage.distance_transform_edt(~mask, sampling=grid.pitch)
     inside = ndimage.distance_transform_edt(mask, sampling=grid.pitch)
-    field = outside - inside
+    field = (outside - inside).astype(np.float32)
+    del outside, inside  # each is as large as the grid; drop them before filtering
 
     level = max(float(clearance), grid.pitch * 0.5)
+
+    if field_sigma_voxels > 0:
+        # Cap the filter width against the extraction level: the level set of
+        # a smoothed field shifts by about sigma^2 * curvature / 2, and the
+        # tightest curvature on an offset surface is 1/level (the rounded
+        # payload edges). At 0.6 * level the worst-case shift is under a fifth
+        # of the clearance; at the default sigma and pitch it is millimetres.
+        sigma = min(field_sigma_voxels * grid.pitch, 0.6 * level) / grid.pitch
+        field = ndimage.gaussian_filter(field, sigma=sigma)
+
     if float(field.max()) <= level:
         raise ValueError("Clearance exceeds the padding around the payload")
 

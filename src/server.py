@@ -195,17 +195,31 @@ def active_job() -> dict | None:
     return {"id": running.id, "kind": running.kind} if running else None
 
 
-def encode_mesh(mesh) -> bytes:
+def encode_mesh(mesh, crease_deg: float = 30.0) -> bytes:
     """Pack a mesh as [uint32 triangles][float32 positions][float32 normals].
 
     Sent once per geometry change; the browser applies the attitude and ride
     height itself so dragging a slider costs nothing on the wire.
+
+    Normals are smooth-shaded with creases preserved: each corner takes the
+    averaged vertex normal unless that disagrees with its own face by more
+    than ``crease_deg``, in which case the corner stays flat. A generated
+    fairing renders as the smooth surface it is, while a payload cube keeps
+    its sharp edges instead of looking inflated. Flat normals everywhere --
+    the previous behaviour -- made even a genuinely smooth hull look
+    faceted, which read as a meshing defect rather than a shading one.
     """
     triangles = np.asarray(mesh.triangles, dtype=np.float32)  # (T, 3, 3)
     count = int(triangles.shape[0])
-    face_normals = np.asarray(mesh.face_normals, dtype=np.float32)  # (T, 3)
-    normals = np.repeat(face_normals[:, None, :], 3, axis=1).astype(np.float32)
-    return struct.pack("<I", count) + triangles.tobytes() + normals.tobytes()
+    face_normals = np.asarray(mesh.face_normals, dtype=np.float64)  # (T, 3)
+
+    corner = np.asarray(mesh.vertex_normals, dtype=np.float64)[mesh.faces]  # (T, 3, 3)
+    agreement = np.einsum("tcj,tj->tc", corner, face_normals)  # cos per corner
+    flat = agreement < np.cos(np.radians(crease_deg))
+    if flat.any():
+        corner[flat] = np.repeat(face_normals[:, None, :], 3, axis=1)[flat]
+
+    return struct.pack("<I", count) + triangles.tobytes() + corner.astype(np.float32).tobytes()
 
 
 def centered_mesh(scene: Scene):
