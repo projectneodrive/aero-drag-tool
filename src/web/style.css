@@ -124,28 +124,6 @@ body {
 
 .brand-name { font-weight: 600; letter-spacing: -0.01em; }
 
-.scene-id {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: 8px;
-  min-width: 0;
-}
-
-.scene-name {
-  font: inherit;
-  font-weight: 500;
-  color: var(--text-primary);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 3px 6px;
-  width: 180px;
-  min-width: 0;
-}
-.scene-name:hover:not(:disabled) { border-color: var(--border); }
-.scene-name:focus { outline: 2px solid var(--series-openfoam); outline-offset: 0; }
-
 .topbar-actions {
   margin-left: auto;
   display: flex;
@@ -182,6 +160,17 @@ body {
 .btn-quiet { background: transparent; color: var(--text-secondary); }
 .btn-wide { width: 100%; }
 
+/* The second verb. Orange because deriving a shape is the shape-run colour,
+   the same hue its tab and its sweep chart carry. */
+.btn-shape {
+  background: var(--series-su2);
+  border-color: transparent;
+  color: #ffffff;
+  font-weight: 600;
+}
+.btn-shape:hover:not(:disabled) { filter: brightness(1.08); }
+.btn-big { font-size: 13px; padding: 8px 18px; }
+
 .text-input {
   font: inherit;
   font-size: 12px;
@@ -193,6 +182,98 @@ body {
   min-width: 0;
 }
 .text-input:focus { outline: 2px solid var(--series-openfoam); outline-offset: 0; }
+
+/* ------------------------------------------------------------- tab bar */
+
+/* One tab per run. The glyph carries two things at once: hue is the kind
+   (blue solves drag, orange derives shapes) and fill is the state, so a
+   glance at the bar answers "what is open and what is it doing". */
+.tabbar {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 0 8px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px 10px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  max-width: 260px;
+}
+.tab:hover { color: var(--text-primary); background: var(--surface-1); }
+.tab.is-active { color: var(--text-primary); font-weight: 600; border-bottom-color: var(--series-openfoam); }
+.tab.is-active.is-shape { border-bottom-color: var(--series-su2); }
+.tab:focus-visible { outline: 2px solid var(--series-openfoam); outline-offset: -3px; }
+
+.tab-label { overflow: hidden; text-overflow: ellipsis; }
+
+.tab-close {
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 3px;
+  border-radius: 4px;
+}
+.tab-close:hover { color: var(--text-primary); background: var(--border); }
+
+.glyph { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
+.glyph-drag { background: var(--series-openfoam); }
+.glyph-shape { background: var(--series-su2); }
+.glyph-draft { background: transparent; border: 1.5px dashed var(--axis); }
+.glyph-failed { background: var(--critical); }
+.glyph-running { background: var(--warning); animation: pulse 1.1s ease-in-out infinite; }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* A solving run reports progress from every tab, not only its own. */
+.tab-progress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--warning);
+  transition: width 400ms ease;
+}
+
+.tab-add {
+  display: flex;
+  align-items: center;
+  padding: 0 11px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  font: inherit;
+  font-size: 17px;
+  cursor: pointer;
+}
+.tab-add:hover { color: var(--text-primary); }
+
+.tabbar-note {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 16px;
+  padding-right: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 
 /* -------------------------------------------------------------- layout */
 
@@ -232,7 +313,102 @@ body {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
+
+/* ------------------------------------------------------- run identity */
+
+.runhead {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+}
+
+.runhead-top { display: flex; align-items: center; gap: 8px; }
+
+.runhead-title {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 3px 6px;
+  margin-left: -6px;
+  flex: 1;
+  min-width: 0;
+}
+.runhead-title:hover:not(:disabled) { border-color: var(--border); }
+.runhead-title:focus { outline: 2px solid var(--series-openfoam); background: var(--panel); }
+
+.runhead-desc {
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 3px 6px;
+  margin-left: -6px;
+  width: calc(100% + 6px);
+  resize: vertical;
+  margin-top: 2px;
+}
+.runhead-desc:hover:not(:disabled) { border-color: var(--border); }
+.runhead-desc:focus { outline: 2px solid var(--series-openfoam); background: var(--panel); }
+
+/* Where this run's shape came from. Every run has one, so the chain from
+   payload to final hull is readable without guessing. */
+.lineage {
+  margin-top: 6px;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+.lineage-arrow { color: var(--axis); }
+.lineage a { color: var(--series-openfoam); text-decoration: none; border-bottom: 1px dotted currentColor; }
+
+.factrow { display: flex; flex-direction: column; gap: 3px; margin: 0; font-size: 11.5px; }
+.fact { display: flex; justify-content: space-between; gap: 10px; }
+.fact dt { color: var(--text-muted); }
+.fact dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.freeze-note {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 11px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warning);
+  border-radius: 8px;
+  color: var(--text-secondary);
+}
+
+.advanced { margin-top: 12px; }
+.advanced summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 0;
+}
+.advanced summary:hover { color: var(--text-primary); }
+.advanced .controls { margin-top: 9px; }
+
+.empty { padding: 26px 4px; text-align: center; color: var(--text-secondary); font-size: 12px; }
+.empty p { margin: 0 0 6px; }
 
 .subhead {
   margin: 20px 0 8px;
@@ -283,9 +459,13 @@ body {
 .control-check {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   grid-template-columns: none;
 }
+/* grid-column does nothing in a flex row, so the as-run line needs its own
+   way onto a line of its own. */
+.control-check .was { flex-basis: 100%; margin-top: 0; }
 .control-check input { accent-color: var(--series-openfoam); width: 15px; height: 15px; margin: 0; }
 
 .control-select {
@@ -298,15 +478,46 @@ body {
   padding: 3px 6px;
 }
 
-/* Spans both columns so it sits under the label and its input, not beside. */
-.control-hint {
-  grid-column: 1 / -1;
-  margin: 1px 0 0;
-  font-size: 11px;
-  line-height: 1.35;
-  color: var(--text-secondary);
+/* A knob that has moved since this run was solved. The results stay on screen
+   -- they are still a real measurement -- but never without saying so, and
+   never without a way back to the value that produced them. */
+.control.is-changed .control-value {
+  border-color: var(--warning);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 45%, transparent);
+}
+.control.is-changed .control-label { color: var(--text-primary); }
+
+.changed-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warning);
+  flex: none;
+  display: inline-block;
 }
 
+.was {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: -2px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.was button {
+  font: inherit;
+  font-size: 10.5px;
+  color: var(--series-openfoam);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  border-bottom: 1px dotted currentColor;
+}
+
+/* Spans both columns so it sits under the label and its input, not beside. */
 /* ------------------------------------------------------------ solvers */
 
 .solver-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
@@ -348,6 +559,8 @@ body {
 .pill-muted { color: var(--text-muted); }
 .pill-ok { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, transparent); }
 .pill-warn { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 40%, transparent); }
+.pill-run { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 55%, transparent); }
+.pill-draft { color: var(--text-muted); border-style: dashed; }
 
 /* ----------------------------------------------------------- viewport */
 
@@ -365,7 +578,6 @@ body {
   pointer-events: none;
 }
 .view-overlay-top { top: 12px; }
-.view-overlay-bottom { bottom: 12px; }
 
 .view-legend {
   display: flex;
@@ -374,28 +586,12 @@ body {
   color: var(--text-secondary);
 }
 .key { display: flex; align-items: center; gap: 5px; }
-.key.is-hidden { display: none; }
 
 .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
 .swatch-hull { background: var(--hull); }
 .swatch-payload { background: var(--payload); }
 .swatch-wind { background: var(--wind); }
 .swatch-road { background: var(--road); }
-
-.facts {
-  display: grid;
-  grid-template-columns: auto auto;
-  gap: 2px 12px;
-  margin: 0;
-  font-size: 11px;
-}
-.facts dt { color: var(--text-muted); }
-.facts dd {
-  margin: 0;
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
-  color: var(--text-secondary);
-}
 
 .view-hint {
   position: absolute;
@@ -460,6 +656,12 @@ body {
 .tile-sub { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 .tile-span { grid-column: 1 / -1; }
 
+/* A run knows its parent, so its headline number can be shown as a change --
+   which is the number the design loop exists to move. */
+.tile-delta { font-size: 11px; margin-top: 2px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile-delta.is-down { color: var(--good); }
+.tile-delta.is-up { color: var(--critical); }
+
 /* ------------------------------------------------------------- chart */
 
 .legend {
@@ -477,55 +679,7 @@ body {
 .chart-wrap-short { height: 170px; }
 .chart-wrap canvas { display: block; width: 100%; height: 100%; }
 
-/* ------------------------------------------------- computation metadata */
-
-.meta-block { margin-bottom: 14px; }
-
-.meta-title {
-  font: inherit;
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  color: var(--text-primary);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 3px 6px;
-  width: 100%;
-  margin-left: -6px;
-}
-.meta-title:hover:not(:disabled) { border-color: var(--border); }
-.meta-title:focus { outline: 2px solid var(--series-openfoam); background: var(--surface-1); }
-
-.meta-description {
-  font: inherit;
-  font-size: 11.5px;
-  color: var(--text-secondary);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 3px 6px;
-  width: 100%;
-  margin-left: -6px;
-  resize: vertical;
-}
-.meta-description:hover:not(:disabled) { border-color: var(--border); }
-.meta-description:focus { outline: 2px solid var(--series-openfoam); background: var(--surface-1); }
-
-.meta-stamp { font-size: 10.5px; color: var(--text-muted); padding-left: 0; }
-
 /* ------------------------------------------------------- running state */
-
-/* Inputs are locked while a solver runs, so what is on screen is always what
-   the running job was given. */
-.layout.is-running .panel-left { opacity: 0.72; }
-.is-running .btn-file { pointer-events: none; opacity: 0.45; }
-
-.lock-note {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 6px;
-}
 
 .tooltip {
   position: absolute;
@@ -640,10 +794,6 @@ table.data thead th {
   white-space: pre-wrap;
 }
 
-.run-row { display: flex; gap: 8px; margin-top: 10px; }
-
-.stack { display: flex; flex-direction: column; gap: 6px; }
-
 /* ------------------------------------------------------ eta & progress */
 
 .eta {
@@ -653,7 +803,6 @@ table.data thead th {
   min-height: 17px;
 }
 .eta strong { color: var(--text-primary); font-weight: 600; }
-.eta .eta-note { color: var(--text-muted); }
 
 .progress {
   margin-top: 7px;
@@ -675,81 +824,61 @@ table.data thead th {
 .sweep-wrap { height: 96px; margin-bottom: 10px; }
 #sweep-chart { display: block; width: 100%; height: 100%; }
 
-.candidate-list { display: flex; flex-direction: column; gap: 7px; margin-top: 4px; }
+/* ------------------------------------------------------ the as-run record
 
-.candidate {
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  padding: 8px 10px;
-  background: var(--surface-1);
-  cursor: pointer;
-  transition: border-color 120ms;
-}
-.candidate:hover { border-color: var(--axis); }
-.candidate.is-selected {
-  border-color: var(--series-openfoam);
-  box-shadow: inset 0 0 0 1px var(--series-openfoam);
-}
-.candidate.is-best { border-left: 3px solid var(--good); }
+   Immutable, and deliberately styled apart from the editable title above it:
+   this is what the numbers came from, not what the panel currently says. */
 
-.candidate-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 6px;
-}
-.candidate-title { font-size: 12px; font-weight: 600; }
-.candidate-metrics {
-  margin-top: 3px;
-  font-size: 10.5px;
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
-}
-.candidate-flags { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px; }
-
-.tag {
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  padding: 1px 6px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-}
-.tag-good { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, transparent); }
-.tag-warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
-.tag-bad { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); }
-
-/* ---------------------------------------------------------- ranking */
-
-.ranking { display: flex; flex-direction: column; gap: 6px; }
-
-.rank-row {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: 10px;
-  align-items: center;
-  padding: 7px 10px;
+.asrun {
   background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: 8px;
-}
-.rank-row.is-best { border-left: 3px solid var(--good); }
-.rank-place {
-  font-size: 11px;
-  font-weight: 700;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 10.5px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
+  line-height: 1.65;
 }
-.rank-label { font-size: 12px; }
-.rank-sub { font-size: 10.5px; color: var(--text-muted); }
-.rank-value {
-  font-size: 13px;
+.asrun-head {
+  font-family: var(--sans);
+  font-size: 10px;
   font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
 }
-.rank-unit { font-size: 10px; color: var(--text-muted); font-weight: 500; }
+
+/* --------------------------------------------------------- action bar */
+
+/* The two verbs, in a bar that spans the run they act on. Nothing else in
+   the window starts work, so "which shape is this about to fly" is answered
+   by the tab you are in. */
+.actionbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.actionbar-buttons { display: flex; gap: 9px; flex: none; }
+
+.actionbar-text { font-size: 11.5px; color: var(--text-muted); min-width: 0; }
+.actionbar-text b { color: var(--text-secondary); font-weight: 600; }
+
+.actionbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.actionbar-right strong { color: var(--text-primary); }
 
 /* ------------------------------------------------------------- modal */
 
@@ -796,7 +925,7 @@ table.data thead th {
   border-radius: 8px;
 }
 .library-name { font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
-.library-meta { font-size: 10.5px; color: var(--text-muted); }
+.library-sub { font-size: 10.5px; color: var(--text-muted); }
 
 /* ------------------------------------------------------------- toast */
 

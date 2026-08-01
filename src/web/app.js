@@ -1,4 +1,8 @@
-/* Aero drag tool -- scene editor and results view.
+/* Aero drag tool -- run explorer.
+ *
+ * Every tab is one run: a shape, the parameters it was given, and the results
+ * that came back. A solved run never changes, so computing inside one forks a
+ * new tab carrying your edits instead of overwriting what you were reading.
  *
  * The browser holds no physics: it mirrors the server's scene, applies the
  * same placement transform for display, and renders whatever the solvers
@@ -13,8 +17,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 // Colour follows the solver, never its position in the list. A run with only
 // SU2 in it still draws SU2 orange.
 const SOLVERS = {
-  openfoam: { label: 'OpenFOAM', varName: '--series-openfoam', kind: 'cfd' },
-  su2: { label: 'SU2', varName: '--series-su2', kind: 'cfd' },
+  openfoam: { label: 'OpenFOAM', varName: '--series-openfoam' },
+  su2: { label: 'SU2', varName: '--series-su2' },
 };
 const SOLVER_ORDER = ['openfoam', 'su2'];
 
@@ -42,9 +46,9 @@ const CONTROL_SPECS = {
     { key: 'clearance', label: 'Payload clearance', unit: 'm', min: 0.005, max: 0.3, step: 0.005, decimals: 3 },
     { key: 'anisotropy', label: 'Streamwise bias', min: 1, max: 6, step: 0.1, decimals: 1 },
     { key: 'resolution', label: 'Voxel resolution', min: 48, max: 220, step: 4, decimals: 0 },
-    { key: 'streamline', label: 'Streamline the skin', type: 'check' },
-    { key: 'nose_angle_deg', label: 'Nose angle limit', unit: '°', min: 20, max: 70, step: 1, decimals: 0 },
-    { key: 'tail_angle_deg', label: 'Tail taper limit', unit: '°', min: 6, max: 25, step: 1, decimals: 0 },
+    { key: 'streamline', label: 'Streamlined envelope', type: 'check' },
+    { key: 'nose_angle_deg', label: 'Nose angle', unit: '°', min: 10, max: 80, step: 1, decimals: 0 },
+    { key: 'tail_angle_deg', label: 'Tail angle', unit: '°', min: 5, max: 45, step: 1, decimals: 0 },
   ],
   solver: [
     { key: 'reference_speed', label: 'Reference speed', unit: 'm/s', min: 1, max: 60, step: 0.5, decimals: 2 },
@@ -67,19 +71,18 @@ const CONTROL_SPECS = {
 /* ---------------------------------------------------------------- state */
 
 const state = {
-  scene: null,
-  metrics: null,
-  reynolds: null,
-  resolvedMode: null,
-  estimate: null,
+  runs: [],           // tab-bar summaries
+  activeId: null,
+  run: null,          // the full payload of the run on screen
   solvers: [],
+  cores: null,
+  runningId: null,    // which run is solving, whichever tab you are looking at
+  runningJob: null,
   job: null,
   jobTimer: null,
   resultView: 'chart',
   chartHover: null,
-  fairing: null,
-  ranking: [],
-  hasPayload: false,
+  meshKey: null,      // what the viewport currently holds
 };
 
 const $ = (id) => document.getElementById(id);
@@ -121,7 +124,7 @@ function toast(message, isBad = false) {
   element.classList.toggle('is-bad', isBad);
   element.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { element.hidden = true; }, isBad ? 7000 : 3200);
+  toast.timer = setTimeout(() => { element.hidden = true; }, isBad ? 7000 : 3600);
 }
 
 /* ------------------------------------------------------------ formatting */
@@ -146,6 +149,23 @@ function fmtSi(value, digits = 3) {
   if (magnitude >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
   if (magnitude >= 1e3) return `${(value / 1e3).toFixed(2)}k`;
   return value.toPrecision(digits).replace(/\.?0+$/, (match) => (match.includes('.') ? '' : match));
+}
+
+function formatDuration(seconds) {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return '—';
+  if (seconds < 90) return `${Math.round(seconds)} s`;
+  const minutes = seconds / 60;
+  if (minutes < 90) return `${Math.round(minutes)} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = Math.round(minutes % 60);
+  return rest ? `${hours} h ${String(rest).padStart(2, '0')} min` : `${hours} h`;
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
 }
 
 /* ------------------------------------------------------------- viewport */
@@ -236,12 +256,11 @@ const viewport = (() => {
       }),
     );
     hullGroup.add(payloadMesh);
-    document.querySelector('.key-payload').classList.remove('is-hidden');
   }
 
   /* Remembered rather than applied once: the caller sets this while adopting a
-     scene, which happens before the new hull mesh arrives, so setHull has to
-     re-apply it to the fresh material. */
+     run, which happens before the new mesh arrives, so setHull has to re-apply
+     it to the fresh material. */
   function setHullTransparent(transparent) {
     hullTransparent = Boolean(transparent);
     applyHullTransparency();
@@ -257,11 +276,7 @@ const viewport = (() => {
   }
 
   function setHull(buffer) {
-    const view = new DataView(buffer);
-    const triangles = view.getUint32(0, true);
-    const positions = new Float32Array(buffer, 4, triangles * 9);
-    const normals = new Float32Array(buffer, 4 + triangles * 9 * 4, triangles * 9);
-
+    const { positions, normals } = decode(buffer);
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
@@ -285,7 +300,9 @@ const viewport = (() => {
 
     hullEdges = new THREE.LineSegments(
       new THREE.EdgesGeometry(geometry, 28),
-      new THREE.LineBasicMaterial({ color: new THREE.Color(cssVar('--text-primary')), transparent: true, opacity: 0.18 }),
+      new THREE.LineBasicMaterial({
+        color: new THREE.Color(cssVar('--text-primary')), transparent: true, opacity: 0.18,
+      }),
     );
     hullGroup.add(hullEdges);
     applyHullTransparency();
@@ -293,6 +310,17 @@ const viewport = (() => {
     modelScale = Math.max(geometry.boundingSphere.radius * 2, 0.05);
     framed = false;
     $('view-empty').hidden = true;
+  }
+
+  function clearAll() {
+    clear(hullGroup);
+    clear(roadGroup);
+    clear(windGroup);
+    clear(dropGroup);
+    hullMesh = null;
+    hullEdges = null;
+    payloadMesh = null;
+    $('view-empty').hidden = false;
   }
 
   function buildRoad(size) {
@@ -403,8 +431,6 @@ const viewport = (() => {
     const magnitude = Math.hypot(vector[0], vector[1], vector[2]);
     buildWind(magnitude > 1e-9 ? vector : [1, 0, 0], centre);
 
-    document.querySelector('.key-road').classList.toggle('is-hidden', !road.enabled);
-
     if (!framed) {
       // Fit the hull *and* its upstream wind arrow, but keep the orbit centre
       // on the hull so the body stays put as you turn around it.
@@ -419,7 +445,9 @@ const viewport = (() => {
     const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 0.05);
     const distance = radius / Math.sin((camera.fov * Math.PI) / 360) * 1.3;
     controls.target.copy(centre);
-    camera.position.copy(centre).add(new THREE.Vector3(0.75, -1, 0.42).normalize().multiplyScalar(distance));
+    camera.position.copy(centre).add(
+      new THREE.Vector3(0.75, -1, 0.42).normalize().multiplyScalar(distance),
+    );
     camera.near = Math.max(distance / 5000, 0.001);
     camera.far = distance * 40;
     camera.updateProjectionMatrix();
@@ -445,37 +473,34 @@ const viewport = (() => {
   window.addEventListener('resize', resize);
   tick();
 
-  return { setHull, setPayload, setHullTransparent, update, refit: () => { framed = false; } };
+  return {
+    setHull, setPayload, setHullTransparent, update, clearAll,
+    refit: () => { framed = false; },
+  };
 })();
 
 /* -------------------------------------------------------------- controls */
 
 function buildControl(section, spec) {
-  const row = document.createElement('div');
-  row.className = 'control';
+  const row = el('div', 'control');
 
   if (spec.type === 'check') {
     row.classList.add('control-check');
     const input = document.createElement('input');
     input.type = 'checkbox';
     input.id = `ctl-${section}-${spec.key}`;
-    const label = document.createElement('label');
-    label.className = 'control-label';
+    const label = el('label', 'control-label', spec.label);
     label.htmlFor = input.id;
-    label.textContent = spec.label;
     row.append(input, label);
     input.addEventListener('change', () => pushControl(section, spec.key, input.checked));
-    return { row, apply: (value) => { input.checked = Boolean(value); } };
+    return { row, apply: (value) => { input.checked = Boolean(value); }, disable: (off) => { input.disabled = off; } };
   }
 
-  const label = document.createElement('label');
-  label.className = 'control-label';
-  label.textContent = spec.unit ? `${spec.label} (${spec.unit})` : spec.label;
+  const label = el('label', 'control-label', spec.unit ? `${spec.label} (${spec.unit})` : spec.label);
   row.append(label);
 
   if (spec.type === 'select') {
-    const select = document.createElement('select');
-    select.className = 'control-select';
+    const select = el('select', 'control-select');
     for (const [value, text] of spec.options) {
       const option = document.createElement('option');
       option.value = value;
@@ -485,7 +510,7 @@ function buildControl(section, spec) {
     row.append(select);
     label.htmlFor = select.id = `ctl-${section}-${spec.key}`;
     select.addEventListener('change', () => pushControl(section, spec.key, select.value));
-    return { row, apply: (value) => { select.value = value; } };
+    return { row, apply: (value) => { select.value = value; }, disable: (off) => { select.disabled = off; } };
   }
 
   const number = document.createElement('input');
@@ -525,9 +550,12 @@ function buildControl(section, spec) {
     apply: (value) => {
       if (document.activeElement === number) return;
       // Very small quantities such as viscosity are unreadable as decimals.
-      number.value = spec.expo ? Number(value).toExponential(3) : Number(value).toFixed(spec.decimals ?? 3);
+      number.value = spec.expo
+        ? Number(value).toExponential(3)
+        : Number(value).toFixed(spec.decimals ?? 3);
       if (slider) slider.value = value;
     },
+    disable: (off) => { number.disabled = off; if (slider) slider.disabled = off; },
   };
 }
 
@@ -546,13 +574,51 @@ function buildControls() {
   }
 }
 
-function applyControls(scene_) {
+function applyControls(scene) {
   for (const [section, controls] of Object.entries(controlRegistry)) {
-    const values = scene_[section] || {};
+    const values = scene[section] || {};
     for (const [key, control] of Object.entries(controls)) {
       if (values[key] !== undefined && values[key] !== null) control.apply(values[key]);
     }
   }
+}
+
+/* A parameter that has moved since this run was solved gets its as-run value
+   printed underneath, with a way back. The results stay on screen -- they are
+   still a real measurement -- but never without saying what they belong to. */
+function markChangedControls(changed) {
+  for (const controls of Object.values(controlRegistry)) {
+    for (const control of Object.values(controls)) {
+      control.row.classList.remove('is-changed');
+      control.row.querySelector('.was')?.remove();
+    }
+  }
+
+  for (const change of changed || []) {
+    const control = controlRegistry[change.section]?.[change.key];
+    if (!control) continue;
+    control.row.classList.add('is-changed');
+    const was = el('div', 'was');
+    was.append(document.createTextNode(`solved at ${change.as_run_text}`));
+    const revert = el('button', null, 'revert');
+    revert.type = 'button';
+    revert.addEventListener('click', () => {
+      control.apply(change.as_run);
+      pushControl(change.section, change.key, change.as_run);
+    });
+    was.append(revert);
+    control.row.append(was);
+  }
+}
+
+function lockControls(locked) {
+  for (const controls of Object.values(controlRegistry)) {
+    for (const control of Object.values(controls)) control.disable(locked);
+  }
+  $('quality-select').disabled = locked;
+  $('processes-input').disabled = locked;
+  $('btn-reset-attitude').disabled = locked;
+  for (const input of $('solver-list').querySelectorAll('input')) input.disabled = locked;
 }
 
 /* Local echo first so dragging a slider feels immediate, then a debounced
@@ -561,19 +627,20 @@ let pendingPatch = {};
 let patchTimer = null;
 
 function pushControl(section, key, value, live = false) {
-  if (!state.scene) return;
-  state.scene[section][key] = value;
+  const run = state.run;
+  if (!run || run.status === 'running') return;
+  run.scene[section][key] = value;
   if (section === 'wind') {
-    const speed = state.scene.wind.speed;
-    const az = (state.scene.wind.azimuth_deg * Math.PI) / 180;
-    const el = (state.scene.wind.elevation_deg * Math.PI) / 180;
-    state.scene.wind.vector = [
-      speed * Math.cos(el) * Math.cos(az),
-      speed * Math.cos(el) * Math.sin(az),
-      speed * Math.sin(el),
+    const speed = run.scene.wind.speed;
+    const az = (run.scene.wind.azimuth_deg * Math.PI) / 180;
+    const el_ = (run.scene.wind.elevation_deg * Math.PI) / 180;
+    run.scene.wind.vector = [
+      speed * Math.cos(el_) * Math.cos(az),
+      speed * Math.cos(el_) * Math.sin(az),
+      speed * Math.sin(el_),
     ];
   }
-  viewport.update(state.scene);
+  viewport.update(run.scene);
 
   pendingPatch[section] = { ...(pendingPatch[section] || {}), [key]: value };
   clearTimeout(patchTimer);
@@ -581,19 +648,86 @@ function pushControl(section, key, value, live = false) {
 }
 
 async function flushPatch() {
-  if (!Object.keys(pendingPatch).length) return;
+  if (!Object.keys(pendingPatch).length || !state.run) return;
   const patch = pendingPatch;
   pendingPatch = {};
   try {
-    const payload = await api('/api/scene', {
+    const payload = await api(`/api/runs/${state.run.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
-    adoptScene(payload, { keepCamera: true, skipControls: true });
+    adoptRun(payload, { skipControls: true, keepCamera: true });
   } catch (error) {
     toast(`Update failed: ${error.message}`, true);
   }
+}
+
+/* --------------------------------------------------------------- tab bar */
+
+function renderTabs() {
+  const host = $('tabbar');
+  host.textContent = '';
+
+  for (const summary of state.runs) {
+    const tab = el('button', 'tab');
+    tab.type = 'button';
+    if (summary.id === state.activeId) tab.classList.add('is-active');
+    if (summary.kind === 'shape') tab.classList.add('is-shape');
+
+    const glyph = el('span', 'glyph');
+    if (summary.status === 'running') glyph.classList.add('glyph-running');
+    else if (summary.status === 'failed') glyph.classList.add('glyph-failed');
+    else if (summary.status === 'draft') glyph.classList.add('glyph-draft');
+    else glyph.classList.add(summary.kind === 'shape' ? 'glyph-shape' : 'glyph-drag');
+
+    tab.append(glyph, el('span', 'tab-label', summary.title));
+
+    if (summary.changed_count) {
+      const dot = el('i', 'changed-dot');
+      dot.title = `${summary.changed_count} parameter(s) changed since this run was solved`;
+      tab.append(dot);
+    }
+
+    const close = el('span', 'tab-close', '×');
+    close.title = 'Close this run';
+    close.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await closeRun(summary.id);
+    });
+    tab.append(close);
+
+    // A solving run reports progress from every tab, not just its own.
+    if (summary.status === 'running') {
+      const bar = el('span', 'tab-progress');
+      const fraction = state.job?.progress?.fraction;
+      bar.style.width = `${Math.round((fraction ?? 0.04) * 100)}%`;
+      tab.append(bar);
+    }
+
+    tab.addEventListener('click', () => selectRun(summary.id));
+    host.append(tab);
+  }
+
+  const add = el('button', 'tab-add', '+');
+  add.type = 'button';
+  add.title = 'Import an STL as a new run';
+  add.setAttribute('aria-label', 'New run');
+  add.addEventListener('click', () => $('file-stl').click());
+  host.append(add);
+
+  const note = el('div', 'tabbar-note');
+  const busy = state.runs.find((item) => item.status === 'running');
+  if (busy) {
+    note.append(el('span', 'glyph glyph-running'));
+    const remaining = state.job?.progress?.remaining_text;
+    note.append(document.createTextNode(
+      `${busy.title} solving${remaining ? ` · ~${remaining} left` : ''}`,
+    ));
+  } else if (state.runs.length) {
+    note.textContent = `${state.runs.length} run${state.runs.length === 1 ? '' : 's'} open`;
+  }
+  host.append(note);
 }
 
 /* --------------------------------------------------------------- solvers */
@@ -601,148 +735,83 @@ async function flushPatch() {
 function renderSolverList() {
   const host = $('solver-list');
   host.textContent = '';
-  const selected = new Set(state.scene ? state.scene.solver.backends : []);
+  const run = state.run;
+  const selected = new Set(run ? run.scene.solver.backends : []);
 
   for (const name of SOLVER_ORDER) {
     const info = state.solvers.find((item) => item.name === name);
     if (!info) continue;
 
-    const row = document.createElement('div');
-    row.className = 'solver-row';
+    const row = el('div', 'solver-row');
     if (!info.available) row.classList.add('is-off');
 
     const check = document.createElement('input');
     check.type = 'checkbox';
     check.id = `solver-${name}`;
     check.checked = selected.has(name);
-    check.disabled = !state.scene;
+    check.disabled = !run || run.status === 'running';
 
-    const label = document.createElement('label');
-    label.className = 'solver-name';
+    const label = el('label', 'solver-name');
     label.htmlFor = check.id;
-    const dot = document.createElement('i');
-    dot.className = `dot dot-${name}`;
-    label.append(dot, document.createTextNode(info.label));
+    label.append(el('i', `dot dot-${name}`), document.createTextNode(info.label));
 
-    const pill = document.createElement('span');
-    pill.className = `pill ${info.available ? 'pill-ok' : 'pill-warn'}`;
-    pill.textContent = info.available ? 'ready' : 'not here';
+    const pill = el('span', `pill ${info.available ? 'pill-ok' : 'pill-warn'}`,
+      info.available ? 'ready' : 'not here');
 
-    const detail = document.createElement('div');
-    detail.className = 'solver-detail';
-    detail.textContent = info.detail;
-
-    row.append(check, label, pill, detail);
+    row.append(check, label, pill, el('div', 'solver-detail', info.detail));
     host.append(row);
 
     check.addEventListener('change', () => {
       const backends = SOLVER_ORDER.filter((item) => $(`solver-${item}`)?.checked);
-      state.scene.solver.backends = backends;
+      state.run.scene.solver.backends = backends;
       pendingPatch.solver = { ...(pendingPatch.solver || {}), backends };
       flushPatch();
-      updateRunButton();
+      renderActions();
     });
   }
-}
-
-/* Re-probe the backends. Worth doing after the rank count changes, because
-   each solver reports the count it will actually run with. */
-async function refreshSolvers() {
-  try {
-    const payload = await api('/api/solvers');
-    state.solvers = payload.solvers;
-    state.cores = payload.cores || null;
-  } catch (error) {
-    return;
-  }
-  renderSolverList();
-  renderProcesses();
 }
 
 function renderProcesses() {
   const input = $('processes-input');
   const hint = $('processes-hint');
   const cores = state.cores;
-  if (!cores) {
-    input.disabled = true;
-    hint.textContent = '';
-    return;
-  }
-
-  input.disabled = !state.scene;
+  if (!cores) return;
+  const pinned = state.run?.scene.solver.processes;
+  if (document.activeElement !== input) input.value = pinned ?? '';
   input.max = cores.available;
-
-  // An empty field is the default state, not a missing value: leaving it blank
-  // is what makes the scene portable to a machine with a different core count.
-  const pinned = state.scene ? state.scene.solver.processes : cores.processes;
-  input.value = pinned == null ? '' : pinned;
-  input.placeholder = cores.default_processes;
-
-  hint.textContent = pinned == null
-    ? `Auto: ${cores.default_processes} of ${cores.available} cores (80%). Set a number to pin it.`
-    : `Pinned to ${pinned} of ${cores.available} cores. Clear the field to go back to auto.`;
-}
-
-function updateRunButton() {
-  const button = $('btn-run');
-  if (!state.scene) {
-    button.disabled = true;
-    button.textContent = 'Compute drag';
-    $('btn-analyze').disabled = true;
-    $('btn-compare').disabled = true;
-    $('btn-download-stl').disabled = true;
-    return;
-  }
-  const running = Boolean(state.job && state.job.status === 'running');
-  const backends = state.scene.solver.backends || [];
-  button.disabled = running || backends.length === 0;
-  button.textContent = running ? 'Running…' : `Compute drag (${backends.length})`;
-  $('btn-analyze').disabled = running || !state.hasPayload;
-  $('btn-compare').disabled = running || !(state.fairing?.candidates || []).length;
-  $('btn-download-stl').disabled = running || !state.scene;
-  setInputsLocked(running);
+  input.placeholder = `auto (${cores.default_processes})`;
+  hint.textContent = pinned
+    ? `Pinned to ${pinned} of ${cores.available} cores.`
+    : `Blank uses ${cores.default_processes} ranks, 80% of the ${cores.available} cores here.`;
 }
 
 /* -------------------------------------------------------------- geometry */
 
 function tile(label, value, unit, sub, accent) {
-  const element = document.createElement('div');
-  element.className = 'tile';
+  const element = el('div', 'tile');
 
-  const head = document.createElement('div');
-  head.className = 'tile-label';
+  const head = el('div', 'tile-label');
   if (accent) {
-    const dot = document.createElement('i');
-    dot.className = 'dot';
+    const dot = el('i', 'dot');
     dot.style.background = accent;
     head.append(dot);
   }
   head.append(document.createTextNode(label));
 
-  const body = document.createElement('div');
-  body.className = 'tile-value';
+  const body = el('div', 'tile-value');
   body.append(document.createTextNode(value));
-  if (unit) {
-    const unitSpan = document.createElement('span');
-    unitSpan.className = 'tile-unit';
-    unitSpan.textContent = unit;
-    body.append(unitSpan);
-  }
+  if (unit) body.append(el('span', 'tile-unit', unit));
 
   element.append(head, body);
-  if (sub) {
-    const subElement = document.createElement('div');
-    subElement.className = 'tile-sub';
-    subElement.textContent = sub;
-    element.append(subElement);
-  }
+  if (sub) element.append(el('div', 'tile-sub', sub));
   return element;
 }
 
 function renderGeometry() {
   const host = $('geometry-tiles');
   host.textContent = '';
-  const metrics = state.metrics;
+  const metrics = state.run?.metrics;
+  $('geometry-block').hidden = !metrics;
   if (!metrics) return;
 
   host.append(tile('Frontal area', fmt(metrics.frontal_area, 4), 'm²', 'true silhouette at this wind angle'));
@@ -757,18 +826,42 @@ function renderGeometry() {
   host.append(box);
 }
 
+function renderShapeFacts() {
+  const run = state.run;
+  const host = $('shape-facts');
+  host.textContent = '';
+  $('shape-block').hidden = !run;
+  if (!run) return;
+
+  $('shape-title').textContent = run.kind === 'shape' ? 'Payload' : 'Shape';
+
+  const rows = [['File', run.scene.geometry.source_name]];
+  if (run.metrics) {
+    rows.push(['Frontal area', `${fmt(run.metrics.frontal_area, 4)} m²`]);
+    rows.push(['Triangles', String(run.metrics.triangle_count)]);
+  }
+  if (run.scene.fairing && run.kind !== 'shape') {
+    rows.push(['Closing radius', `${(run.scene.fairing.closing_radius * 1000).toFixed(0)} mm`]);
+    rows.push(['Clearance', `${(run.scene.fairing.clearance * 1000).toFixed(0)} mm`]);
+  }
+
+  for (const [key, value] of rows) {
+    const row = el('div', 'fact');
+    row.append(el('dt', null, key), el('dd', null, value));
+    host.append(row);
+  }
+}
+
 function renderReynoldsNote() {
   const note = $('reynolds-note');
-  const advice = state.reynolds;
-  if (!advice) { note.hidden = true; return; }
+  const advice = state.run?.reynolds;
+  if (!advice || state.run?.kind === 'shape') { note.hidden = true; return; }
 
   note.textContent = '';
   note.className = `note ${advice.crosses_critical_band || advice.ratio > 3 ? 'note-warn' : 'note-good'}`;
 
-  const head = document.createElement('strong');
-  const mode = state.resolvedMode === 'sweep' ? 'Solving every speed' : 'One run, curve scaled as V²';
-  head.textContent = `${mode}. `;
-  note.append(head);
+  const mode = state.run.resolved_mode === 'sweep' ? 'Solving every speed' : 'One run, curve scaled as V²';
+  note.append(el('strong', null, `${mode}. `));
   note.append(document.createTextNode(advice.warnings.join(' ')));
   note.hidden = false;
 }
@@ -834,7 +927,7 @@ function drawChart(key = 'force') {
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, width, height);
 
-  const series = chartSeries(state.scene?.results);
+  const series = chartSeries(state.run?.results);
   layout.series = series;
   if (!series.length) return;
 
@@ -865,7 +958,10 @@ function drawChart(key = 'force') {
 
   const xScale = (value) => padLeft + ((value - xMin) / (xMax - xMin || 1)) * plotWidth;
   const yScale = (value) => padTop + plotHeight - ((value - yMin) / (yMax - yMin || 1)) * plotHeight;
-  Object.assign(layout, { left: padLeft, right: padLeft + plotWidth, top: padTop, bottom: padTop + plotHeight, xScale, yScale, xMin, xMax });
+  Object.assign(layout, {
+    left: padLeft, right: padLeft + plotWidth, top: padTop,
+    bottom: padTop + plotHeight, xScale, yScale, xMin, xMax,
+  });
 
   context.font = '10px system-ui, sans-serif';
   context.lineWidth = 1;
@@ -987,17 +1083,15 @@ function drawCharts() {
 function renderChartLegend() {
   const host = $('chart-legend');
   host.textContent = '';
-  const series = chartSeries(state.scene?.results);
+  const series = chartSeries(state.run?.results);
   if (series.length < 1) return;
 
   // Two or more series need a legend to carry identity. One does not -- the
   // solver tile below names it, and the endpoint is directly labelled.
   if (series.length > 1) {
     for (const item of series) {
-      const key = document.createElement('span');
-      key.className = 'legend-key';
-      const line = document.createElement('i');
-      line.className = 'legend-line';
+      const key = el('span', 'legend-key');
+      const line = el('i', 'legend-line');
       line.style.background = item.color;
       key.append(line, document.createTextNode(item.label));
       host.append(key);
@@ -1006,10 +1100,8 @@ function renderChartLegend() {
 
   const anyScaled = series.some((item) => item.points.some((point) => point.source === 'scaled'));
   if (anyScaled) {
-    const note = document.createElement('span');
-    note.className = 'legend-key';
+    const note = el('span', 'legend-key', 'hollow markers = scaled from one solve');
     note.style.color = cssVar('--text-muted');
-    note.textContent = 'hollow markers = scaled from one solve';
     host.append(note);
   }
 }
@@ -1049,38 +1141,22 @@ function setupChartHover(key = 'force') {
     drawCharts();
 
     tooltip.textContent = '';
-    const head = document.createElement('div');
-    head.className = 'tooltip-head';
-    head.textContent = `${fixed(nearest, 2)} m/s`;
-    tooltip.append(head);
+    tooltip.append(el('div', 'tooltip-head', `${fixed(nearest, 2)} m/s`));
 
     for (const item of series) {
       const point = item.points.reduce(
         (acc, candidate) => (Math.abs(candidate.speed - nearest) < Math.abs(acc.speed - nearest) ? candidate : acc),
         item.points[0],
       );
-      const row = document.createElement('div');
-      row.className = 'tooltip-row';
+      const row = el('div', 'tooltip-row');
 
-      const swatch = document.createElement('i');
-      swatch.className = 'tooltip-key';
+      const swatch = el('i', 'tooltip-key');
       swatch.style.background = item.color;
 
-      const value = document.createElement('span');
-      value.className = 'tooltip-value';
-      value.textContent = spec.format(spec.value(point));
-
-      const name = document.createElement('span');
-      name.className = 'tooltip-name';
-      name.textContent = item.label;
-
-      row.append(swatch, value, name);
-      if (point.source === 'scaled') {
-        const tag = document.createElement('span');
-        tag.className = 'tooltip-tag';
-        tag.textContent = 'scaled';
-        row.append(tag);
-      }
+      row.append(swatch,
+        el('span', 'tooltip-value', spec.format(spec.value(point))),
+        el('span', 'tooltip-name', item.label));
+      if (point.source === 'scaled') row.append(el('span', 'tooltip-tag', 'scaled'));
       tooltip.append(row);
     }
 
@@ -1098,27 +1174,24 @@ function setupChartHover(key = 'force') {
 function renderTable() {
   const host = $('table-wrap');
   host.textContent = '';
-  const series = chartSeries(state.scene?.results);
+  const series = chartSeries(state.run?.results);
   if (!series.length) return;
 
   const speeds = [...new Set(series.flatMap((item) => item.points.map((point) => point.speed)))]
     .sort((a, b) => a - b);
 
-  const table = document.createElement('table');
-  table.className = 'data';
-  const caption = document.createElement('caption');
-  caption.textContent = 'Cd is listed per speed because it is not constant: it varies with Reynolds '
-    + 'number. Values marked * were scaled from a single solve.';
-  table.append(caption);
+  const table = el('table', 'data');
+  table.append(el('caption', null,
+    'Cd is listed per speed because it is not constant: it varies with Reynolds number. '
+    + 'Values marked * were scaled from a single solve.'));
 
   const thead = document.createElement('thead');
   const headRow = document.createElement('tr');
   const columns = ['Speed (m/s)', 'Re'];
   for (const item of series) columns.push(`${item.label} Cd`, `${item.label} (N)`);
   for (const text of columns) {
-    const th = document.createElement('th');
+    const th = el('th', null, text);
     th.scope = 'col';
-    th.textContent = text;
     headRow.append(th);
   }
   thead.append(headRow);
@@ -1127,27 +1200,18 @@ function renderTable() {
   const tbody = document.createElement('tbody');
   for (const speed of speeds) {
     const row = document.createElement('tr');
-    const th = document.createElement('th');
+    const th = el('th', null, fixed(speed, 2));
     th.scope = 'row';
-    th.textContent = fixed(speed, 2);
     row.append(th);
 
     const reference = series[0].points.find((point) => Math.abs(point.speed - speed) < 1e-9);
-    const re = document.createElement('td');
-    re.textContent = reference ? fmtSi(reference.reynolds) : '—';
-    row.append(re);
+    row.append(el('td', null, reference ? fmtSi(reference.reynolds) : '—'));
 
     for (const item of series) {
       const point = item.points.find((candidate) => Math.abs(candidate.speed - speed) < 1e-9);
       const mark = point && point.source === 'scaled' ? ' *' : '';
-
-      const cd = document.createElement('td');
-      cd.textContent = point ? `${fixed(point.drag_coefficient, 4)}${mark}` : '—';
-      row.append(cd);
-
-      const force = document.createElement('td');
-      force.textContent = point ? `${fixed(point.drag_force, 2)}${mark}` : '—';
-      row.append(force);
+      row.append(el('td', null, point ? `${fixed(point.drag_coefficient, 4)}${mark}` : '—'));
+      row.append(el('td', null, point ? `${fixed(point.drag_force, 2)}${mark}` : '—'));
     }
     tbody.append(row);
   }
@@ -1157,71 +1221,92 @@ function renderTable() {
 
 /* -------------------------------------------------------------- results */
 
+function renderResultTiles() {
+  const host = $('result-tiles');
+  host.textContent = '';
+  const run = state.run;
+  if (!run || run.drag_area === null || run.drag_area === undefined) return;
+
+  const dragAreaTile = tile('Drag area Cd·A', fixed(run.drag_area, 4), 'm²');
+  const reference = run.reference;
+  if (reference && reference.drag_area > 0) {
+    const change = (run.drag_area - reference.drag_area) / reference.drag_area;
+    const delta = el('div', `tile-delta ${change < 0 ? 'is-down' : 'is-up'}`,
+      `${change < 0 ? '−' : '+'} ${Math.abs(change * 100).toFixed(1)}% vs ${reference.title}`);
+    dragAreaTile.append(delta);
+  } else {
+    dragAreaTile.append(el('div', 'tile-sub', 'no earlier run to compare against'));
+  }
+  host.append(dragAreaTile);
+
+  const point = (run.results?.runs || [])
+    .filter((item) => item.status === 'ok')
+    .flatMap((item) => item.points)
+    .find((item) => item.source === 'solved');
+  if (point) {
+    host.append(tile('Cd', fixed(point.drag_coefficient, 4), null,
+      `at ${fixed(point.speed, 1)} m/s · A ${fixed(point.frontal_area, 4)} m²`));
+  }
+}
+
 function renderSolverTiles() {
   const host = $('solver-tiles');
   host.textContent = '';
-  const results = state.scene?.results;
+  const results = state.run?.results;
   if (!results) return;
 
   for (const run of results.runs) {
     const colour = seriesColor(run.solver);
     if (run.status !== 'ok') {
-      const element = tile(solverLabel(run.solver), run.status === 'unavailable' ? 'not run' : 'failed', null,
+      const element = tile(solverLabel(run.solver),
+        run.status === 'unavailable' ? 'not run' : 'failed', null,
         run.message.slice(0, 140), colour);
       element.classList.add('tile-span');
       host.append(element);
       continue;
     }
     const reference = run.points.find((point) => point.source === 'solved') || run.points[0];
-    const element = tile(
+    host.append(tile(
       solverLabel(run.solver),
       fmt(reference.drag_coefficient, 4),
       'Cd',
       `${run.mode === 'sweep' ? 'solved each speed' : 'one solve, scaled'} · ${fixed(run.wall_time_s, 1)} s`,
       colour,
-    );
-    host.append(element);
+    ));
   }
 }
 
 function renderWarnings() {
   const host = $('result-warnings');
   host.textContent = '';
-  const results = state.scene?.results;
+  const results = state.run?.results;
   if (!results) return;
 
   for (const warning of results.warnings) {
-    const note = document.createElement('div');
     const lowered = warning.toLowerCase();
     const bad = lowered.includes('disagree') || lowered.includes('not watertight');
     const good = lowered.includes('agree within');
-    note.className = `note ${bad ? 'note-bad' : good ? 'note-good' : 'note-warn'}`;
-    note.textContent = warning;
-    host.append(note);
+    host.append(el('div', `note ${bad ? 'note-bad' : good ? 'note-good' : 'note-warn'}`, warning));
   }
 
   for (const run of results.runs) {
     if (run.status === 'ok' && run.message) {
-      const note = document.createElement('div');
-      note.className = 'note note-warn';
-      note.textContent = `${solverLabel(run.solver)}: ${run.message}`;
-      host.append(note);
+      host.append(el('div', 'note note-warn', `${solverLabel(run.solver)}: ${run.message}`));
     }
   }
 }
 
 function renderResults() {
-  const section = $('results-section');
-  const results = state.scene?.results;
-  if (!results || !results.runs.length) {
-    section.hidden = true;
-    return;
-  }
-  section.hidden = false;
+  const run = state.run;
+  const hasResults = Boolean(run && run.kind === 'drag' && run.results?.runs?.length);
+  $('results-block').hidden = !hasResults;
+  if (!hasResults) return;
+
+  renderResultTiles();
   renderChartLegend();
   renderSolverTiles();
   renderWarnings();
-  renderResultMeta();
+
   if (state.resultView === 'chart') {
     $('chart-panels').hidden = false;
     $('table-wrap').hidden = true;
@@ -1246,30 +1331,17 @@ function setResultView(view) {
   renderResults();
 }
 
-/* ---------------------------------------------------- fairing candidates */
+/* ---------------------------------------------------------- shape results */
 
-function formatDuration(seconds) {
-  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return '—';
-  if (seconds < 90) return `${Math.round(seconds)} s`;
-  const minutes = seconds / 60;
-  if (minutes < 90) return `${Math.round(minutes)} min`;
-  const hours = Math.floor(minutes / 60);
-  const rest = Math.round(minutes % 60);
-  return rest ? `${hours} h ${String(rest).padStart(2, '0')} min` : `${hours} h`;
-}
-
-/* The staircase: how many separate bodies survive at each closing radius.
-   Flat runs are the stable topologies, and the wider the run the more the
-   design is a real choice rather than two lumps happening to nearly touch. */
+/* The staircase: how many separate bodies survive at each closing radius, and
+   where it first reaches one. That radius is what the shell was built at, so
+   the chart is the justification for the shape rather than decoration. */
 function drawSweepChart() {
-  const block = $('sweep-block');
-  const sweep = state.fairing?.sweep;
-  if (!sweep || !sweep.radii?.length) { block.hidden = true; return; }
-  block.hidden = false;
-
   const canvas = $('sweep-chart');
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
+  const wrap = canvas.parentElement;
+  const sweep = state.run?.sweep;
+  const width = wrap.clientWidth;
+  const height = wrap.clientHeight;
   if (!width || !height) return;
 
   const ratio = Math.min(window.devicePixelRatio, 2);
@@ -1278,449 +1350,587 @@ function drawSweepChart() {
   const context = canvas.getContext('2d');
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, width, height);
+  if (!sweep || !sweep.radii.length) return;
 
-  const padLeft = 20;
+  const padLeft = 26;
+  const padRight = 10;
+  const padTop = 8;
   const padBottom = 16;
-  const padTop = 6;
-  const plotWidth = width - padLeft - 6;
+  const plotWidth = width - padLeft - padRight;
   const plotHeight = height - padTop - padBottom;
+  if (plotWidth < 20 || plotHeight < 20) return;
 
-  const radii = sweep.radii;
-  const counts = sweep.components;
-  const rMax = Math.max(...radii) || 1;
-  const cMax = Math.max(...counts, 1);
-
+  const rMax = Math.max(...sweep.radii) || 1;
+  const cMax = Math.max(...sweep.components, 2);
   const x = (r) => padLeft + (r / rMax) * plotWidth;
   const y = (c) => padTop + plotHeight - ((c - 0.5) / (cMax + 0.5 - 0.5)) * plotHeight;
 
-  context.strokeStyle = cssVar('--grid');
-  context.lineWidth = 1;
-  context.beginPath();
-  context.moveTo(padLeft, padTop + plotHeight + 0.5);
-  context.lineTo(padLeft + plotWidth, padTop + plotHeight + 0.5);
-  context.stroke();
-
-  // Step plot: the count holds until the next sample.
-  context.strokeStyle = cssVar('--series-openfoam');
-  context.lineWidth = 2;
-  context.beginPath();
-  radii.forEach((radius, index) => {
-    const px = x(radius);
-    const py = y(counts[index]);
-    if (index === 0) context.moveTo(px, py);
-    else { context.lineTo(px, y(counts[index - 1])); context.lineTo(px, py); }
-  });
-  context.lineTo(padLeft + plotWidth, y(counts[counts.length - 1]));
-  context.stroke();
-
-  context.fillStyle = cssVar('--text-muted');
   context.font = '9px system-ui, sans-serif';
+  context.strokeStyle = cssVar('--grid');
+  context.fillStyle = cssVar('--text-muted');
   context.textAlign = 'right';
   context.textBaseline = 'middle';
-  for (const count of [...new Set(counts)]) context.fillText(String(count), padLeft - 4, y(count));
+  context.lineWidth = 1;
+  for (let count = 1; count <= cMax; count += Math.max(1, Math.floor(cMax / 3))) {
+    const yy = Math.round(y(count)) + 0.5;
+    context.beginPath();
+    context.moveTo(padLeft, yy);
+    context.lineTo(padLeft + plotWidth, yy);
+    context.stroke();
+    context.fillText(String(count), padLeft - 5, yy);
+  }
 
-  context.textAlign = 'center';
+  // The staircase itself, drawn as steps: the count holds until the next
+  // sampled radius, which is what "this topology survives to here" means.
+  context.strokeStyle = cssVar('--series-su2');
+  context.lineWidth = 2;
+  context.lineJoin = 'round';
+  context.beginPath();
+  sweep.radii.forEach((radius, index) => {
+    const yy = y(sweep.components[index]);
+    if (index === 0) context.moveTo(x(radius), yy);
+    else {
+      context.lineTo(x(radius), y(sweep.components[index - 1]));
+      context.lineTo(x(radius), yy);
+    }
+  });
+  context.lineTo(padLeft + plotWidth, y(sweep.components[sweep.components.length - 1]));
+  context.stroke();
+
+  if (sweep.merge_radius !== null && sweep.merge_radius !== undefined) {
+    const mx = Math.round(x(sweep.merge_radius)) + 0.5;
+    context.strokeStyle = cssVar('--good');
+    context.lineWidth = 1.5;
+    context.setLineDash([3, 3]);
+    context.beginPath();
+    context.moveTo(mx, padTop);
+    context.lineTo(mx, padTop + plotHeight);
+    context.stroke();
+    context.setLineDash([]);
+  }
+
+  context.fillStyle = cssVar('--text-muted');
+  context.textAlign = 'left';
   context.textBaseline = 'top';
   context.fillText('0', padLeft, padTop + plotHeight + 3);
+  context.textAlign = 'right';
   context.fillText(`${Math.round(rMax * 1000)} mm`, padLeft + plotWidth, padTop + plotHeight + 3);
 }
 
-function renderCandidates() {
-  const host = $('candidate-list');
+function renderShell() {
+  const run = state.run;
+  const shell = run?.shell;
+  $('shell-block').hidden = !(run?.kind === 'shape' && shell);
+  if (!shell) return;
+
+  const host = $('shell-tiles');
   host.textContent = '';
-  const fairing = state.fairing;
-  const candidates = fairing?.candidates || [];
+  host.append(tile('Frontal area', fmt(shell.frontal_area, 4), 'm²', 'the number that sets drag'));
+  host.append(tile('Closing radius', (shell.radius * 1000).toFixed(0), 'mm',
+    shell.merge_radius !== null
+      ? `merges at ${(shell.merge_radius * 1000).toFixed(0)} mm`
+      : null));
+  host.append(tile('Volume', shell.volume === null ? '—' : fmt(shell.volume, 3), 'm³'));
+  host.append(tile('Bodies', String(shell.bodies), null,
+    shell.bodies === 1 ? 'one closed shell, as intended' : 'still split — see the warnings'));
 
-  const bestIndex = state.ranking.length ? state.ranking[0].index : null;
+  const fit = tile('Payload fit',
+    shell.contains_payload === true ? 'encloses' : shell.contains_payload === false ? 'sticks out' : 'unverified',
+    null,
+    `clearance ${(shell.clearance * 1000).toFixed(0)} mm · ${shell.triangle_count} triangles`);
+  fit.classList.add('tile-span');
+  host.append(fit);
 
-  for (const candidate of candidates) {
-    const card = document.createElement('div');
-    card.className = 'candidate';
-    if (candidate.selected) card.classList.add('is-selected');
-    if (candidate.index === bestIndex) card.classList.add('is-best');
-    card.tabIndex = 0;
-    card.setAttribute('role', 'button');
-
-    const head = document.createElement('div');
-    head.className = 'candidate-head';
-    const title = document.createElement('span');
-    title.className = 'candidate-title';
-    title.textContent = candidate.components === 1
-      ? 'One merged shell'
-      : `${candidate.components} separate bodies`;
-    const area = document.createElement('span');
-    area.className = 'rank-value';
-    area.textContent = fixed(candidate.frontal_area, 3);
-    const unit = document.createElement('span');
-    unit.className = 'rank-unit';
-    unit.textContent = ' m²';
-    area.append(unit);
-    head.append(title, area);
-
-    const metrics = document.createElement('div');
-    metrics.className = 'candidate-metrics';
-    const parts = [`r = ${Math.round(candidate.radius * 1000)} mm`];
-    if (candidate.streamlined && candidate.tail_angle_deg) {
-      parts.push(`tail ${Math.round(candidate.tail_angle_deg)}°`);
-    }
-    if (candidate.min_gap) parts.push(`gap ${Math.round(candidate.min_gap * 1000)} mm`);
-    if (candidate.volume) parts.push(`${fixed(candidate.volume, 2)} m³`);
-    metrics.textContent = parts.join(' · ');
-
-    const flags = document.createElement('div');
-    flags.className = 'candidate-flags';
-    const addTag = (text, kind) => {
-      const tag = document.createElement('span');
-      tag.className = `tag tag-${kind}`;
-      tag.textContent = text;
-      flags.append(tag);
-    };
-    if (candidate.contains_payload === true) addTag('payload fits', 'good');
-    else if (candidate.contains_payload === false) addTag('payload sticks out', 'bad');
-    else addTag('fit unchecked', 'warn');
-    if (candidate.choked) addTag('choked gap', 'warn');
-    if (!candidate.watertight) addTag('not watertight', 'bad');
-
-    const results = candidate.results;
-    if (results) {
-      const run = (results.runs || []).find((item) => item.status === 'ok');
-      const point = run?.points?.find((item) => item.source === 'solved') || run?.points?.[0];
-      if (point) addTag(`Cd·A ${fixed(point.drag_coefficient * point.frontal_area, 4)} m²`, 'good');
-    }
-
-    card.append(head, metrics, flags);
-    const choose = () => selectCandidate(candidate.index);
-    card.addEventListener('click', choose);
-    card.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); choose(); }
-    });
-    host.append(card);
+  const note = $('sweep-note');
+  if (shell.merge_radius === null || shell.merge_radius === undefined) {
+    note.textContent = 'The payload never merged within the grid, so the shell was built at the largest radius available.';
+  } else {
+    note.textContent = `The payload is ${run.sweep?.bodies_at_zero ?? '?'} separate bodies uncovered and `
+      + `becomes one at ${(shell.merge_radius * 1000).toFixed(0)} mm. The shell was built at `
+      + `${(shell.radius * 1000).toFixed(0)} mm — the smallest radius that holds, since every `
+      + 'millimetre past it is frontal area for nothing.';
   }
 
-  const warnHost = $('fairing-warnings');
+  const warnHost = $('shell-warnings');
   warnHost.textContent = '';
-  for (const warning of fairing?.warnings || []) {
-    const note = document.createElement('div');
-    note.className = 'note note-warn';
-    note.textContent = warning;
-    warnHost.append(note);
+  for (const warning of run.shell_warnings || []) {
+    const lowered = warning.toLowerCase();
+    const bad = lowered.includes('does not fully enclose') || lowered.includes('separate bodies');
+    warnHost.append(el('div', `note ${bad ? 'note-bad' : 'note-warn'}`, warning));
   }
 
   requestAnimationFrame(drawSweepChart);
 }
 
-function renderRanking() {
-  const block = $('ranking-block');
-  const host = $('ranking-list');
+/* ------------------------------------------------------------ run header */
+
+function renderRunHead() {
+  const run = state.run;
+  $('runhead').hidden = !run;
+  if (!run) return;
+
+  const title = $('run-title');
+  const description = $('run-description');
+  if (document.activeElement !== title) title.value = run.title;
+  if (document.activeElement !== description) description.value = run.description || '';
+
+  const status = $('run-status');
+  const labels = {
+    draft: ['draft', 'pill-draft'],
+    running: ['solving', 'pill-run'],
+    done: [run.kind === 'shape' ? 'built' : 'solved', 'pill-ok'],
+    failed: ['failed', 'pill-warn'],
+  };
+  const [text, className] = labels[run.status] || labels.draft;
+  status.textContent = text;
+  status.className = `pill ${className}`;
+
+  // Every run says where its shape came from. The chain from payload to final
+  // hull is then readable without guessing which tab produced which.
+  const lineage = $('run-lineage');
+  lineage.textContent = '';
+  lineage.append(el('span', 'lineage-arrow', '↳'));
+  if (run.parent_id) {
+    lineage.append(document.createTextNode(run.origin === 'forked' ? 'forked from ' : 'from '));
+    const link = el('a', null, run.parent_label);
+    link.href = '#';
+    link.addEventListener('click', (event) => {
+      event.preventDefault();
+      selectRun(run.parent_id);
+    });
+    lineage.append(link);
+  } else {
+    const origin = { sample: 'bundled sample', opened: 'opened from a file' }[run.origin] || 'imported';
+    lineage.append(document.createTextNode(`${origin} · ${run.scene.geometry.source_name}`));
+  }
+}
+
+function renderChangedNote() {
+  const run = state.run;
+  const changed = run?.changed || [];
+  const block = $('changed-block');
+  block.hidden = !changed.length;
+  if (!changed.length) return;
+
+  const note = $('changed-note');
+  note.textContent = '';
+  note.append(el('strong', null,
+    `${changed.length} parameter${changed.length === 1 ? '' : 's'} changed since this run was solved. `));
+  note.append(document.createTextNode(
+    'The results below are still the ones this run produced. Compute drag to solve the new values as a new run.',
+  ));
+}
+
+function renderAsRun() {
+  const run = state.run;
+  const lines = run?.as_run || [];
+  $('asrun-block').hidden = !(lines.length && run.status !== 'running');
+  if (!lines.length) return;
+
+  const host = $('asrun-body');
   host.textContent = '';
-  if (!state.ranking.length) { block.hidden = true; return; }
-  block.hidden = false;
+  host.append(el('div', 'asrun-head', 'the inputs these results came from'));
+  host.append(el('div', null, `${run.scene.geometry.source_name} · A ${fmt(run.metrics?.frontal_area, 4)} m²`));
+  for (const line of lines) host.append(el('div', null, line));
 
-  state.ranking.forEach((entry, position) => {
-    const row = document.createElement('div');
-    row.className = 'rank-row';
-    if (position === 0) row.classList.add('is-best');
-
-    const place = document.createElement('span');
-    place.className = 'rank-place';
-    place.textContent = `${position + 1}`;
-
-    const label = document.createElement('div');
-    const name = document.createElement('div');
-    name.className = 'rank-label';
-    name.textContent = entry.components === 1 ? 'One merged shell' : `${entry.components} separate bodies`;
-    const sub = document.createElement('div');
-    sub.className = 'rank-sub';
-    sub.textContent = `${solverLabel(entry.solver)} · Cd ${fixed(entry.drag_coefficient, 3)} · `
-      + `A ${fixed(entry.frontal_area, 3)} m²`;
-    label.append(name, sub);
-
-    const value = document.createElement('div');
-    value.className = 'rank-value';
-    value.textContent = fixed(entry.drag_area, 4);
-    const unit = document.createElement('span');
-    unit.className = 'rank-unit';
-    unit.textContent = ' m² Cd·A';
-    value.append(unit);
-
-    row.append(place, label, value);
-    host.append(row);
-  });
+  const stamp = $('asrun-stamp');
+  const when = (run.solved_at || '').replace('T', ' ').replace('+00:00', ' UTC');
+  const took = run.duration_s ? ` · took ${formatDuration(run.duration_s)}` : '';
+  stamp.textContent = when ? `solved ${when}${took}` : '';
 }
 
-async function selectCandidate(index) {
-  try {
-    const payload = await api('/api/fairing/select', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ index }),
-    });
-    adoptScene(payload);
-    await loadMesh();
-    await loadPayloadMesh();
-    viewport.update(state.scene);
-    toast('Fairing applied to the scene');
-  } catch (error) { toast(error.message, true); }
-}
+/* -------------------------------------------------------------- progress */
 
-/* ------------------------------------------------------------------ eta */
+function renderProgress() {
+  const run = state.run;
+  const running = run?.status === 'running';
+  $('progress-block').hidden = !running;
+  $('error-block').hidden = run?.status !== 'failed';
 
-function renderEta() {
+  if (run?.status === 'failed') $('error-text').textContent = run.error || 'The run failed.';
+  if (!running) return;
+
+  const job = state.job && state.job.run_id === run.id ? state.job : null;
   const line = $('eta-line');
-  const bar = $('progress-bar');
-  const fill = $('progress-fill');
   line.textContent = '';
-
-  const job = state.job;
-  if (job && job.status === 'running') {
-    const progress = job.progress;
-    bar.hidden = false;
-    if (progress) {
-      fill.style.width = `${Math.round(progress.fraction * 100)}%`;
-      const strong = document.createElement('strong');
-      strong.textContent = `about ${progress.remaining_text} left`;
-      line.append(strong);
-      line.append(document.createTextNode(
-        ` · ${progress.units_done}/${progress.units_total} solves · `
-        + `${formatDuration(job.elapsed_seconds)} elapsed`,
-      ));
-    } else {
-      fill.style.width = '4%';
-      line.textContent = 'starting…';
-    }
-    return;
+  const progress = job?.progress;
+  if (progress) {
+    $('progress-fill').style.width = `${Math.round(progress.fraction * 100)}%`;
+    line.append(el('strong', null, `about ${progress.remaining_text} left`));
+    line.append(document.createTextNode(
+      ` · ${progress.units_done}/${progress.units_total} solves · ${formatDuration(job.elapsed_seconds)} elapsed`,
+    ));
+  } else {
+    $('progress-fill').style.width = '4%';
+    line.textContent = job ? 'starting…' : 'working…';
   }
 
-  bar.hidden = true;
-  fill.style.width = '0%';
-
-  const estimate = state.estimate;
-  if (!estimate || !state.scene) return;
-  const strong = document.createElement('strong');
-  strong.textContent = `~${formatDuration(estimate.total_seconds)}`;
-  line.append(strong);
-  const note = document.createElement('span');
-  note.className = 'eta-note';
-  note.textContent = estimate.calibrated
-    ? ` estimated, from ${estimate.samples} past solves on this machine`
-    : ' estimated (uncalibrated — the first real run will sharpen this)';
-  line.append(note);
-}
-
-/* While a solver runs, every parameter is frozen. Otherwise the panel could
-   show values the running job was never given, and the results would look like
-   they belong to settings that were never used. */
-function setInputsLocked(locked) {
-  const targets = document.querySelectorAll(
-    '.panel-left input, .panel-left select, .panel-left button, '
-    + '#quality-select, #processes-input, #solver-list input, #btn-library, #btn-save',
-  );
-  for (const element of targets) {
-    if (locked) {
-      if (!element.disabled) {
-        element.disabled = true;
-        element.dataset.lockedByRun = '1';
-      }
-    } else if (element.dataset.lockedByRun) {
-      element.disabled = false;
-      delete element.dataset.lockedByRun;
-    }
-  }
-  document.querySelector('.layout').classList.toggle('is-running', locked);
-  document.body.classList.toggle('is-running', locked);
-
-  const note = $('lock-note');
-  if (note) note.hidden = !locked;
-}
-
-function renderResultMeta() {
-  const results = state.scene?.results;
-  const title = $('result-title');
-  const description = $('result-description');
-  const stamp = $('result-stamp');
-  if (!results) return;
-
-  if (document.activeElement !== title) title.value = results.title || '';
-  if (document.activeElement !== description) description.value = results.description || '';
-
-  const when = (results.computed_at || '').replace('T', ' ').replace('+00:00', ' UTC');
-  stamp.textContent = when ? `computed ${when} on ${results.host}` : '';
-}
-
-async function saveResultMeta() {
-  if (!state.scene?.results) return;
-  try {
-    await api('/api/results', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title: $('result-title').value,
-        description: $('result-description').value,
-      }),
-    });
-    state.scene.results.title = $('result-title').value;
-    state.scene.results.description = $('result-description').value;
-  } catch (error) { toast(error.message, true); }
-}
-
-/* ------------------------------------------------------------ scene load */
-
-async function loadMesh() {
-  const response = await api('/api/scene/mesh');
-  const buffer = await response.arrayBuffer();
-  viewport.setHull(buffer);
-}
-
-function adoptScene(payload, options = {}) {
-  if (!payload || !payload.scene) {
-    state.scene = null;
-    return;
-  }
-  state.scene = payload.scene;
-  state.metrics = payload.metrics;
-  state.reynolds = payload.reynolds;
-  state.resolvedMode = payload.resolved_mode;
-  state.estimate = payload.estimate;
-  state.fairing = payload.fairing;
-  state.hasPayload = Boolean(payload.has_payload);
-  // A solve started elsewhere (or before a reload) still owns these inputs.
-  if (payload.active_job && !state.job) {
-    state.job = { ...payload.active_job, status: 'running' };
-    $('run-log').hidden = false;
-    pollJob();
-  }
-
-  if (!options.skipControls) applyControls(state.scene);
-  $('quality-select').value = state.scene.solver.quality || 'balanced';
-  renderProcesses();
-  $('scene-name').value = state.scene.name;
-  $('scene-name').disabled = false;
-  $('btn-save').disabled = false;
-  $('btn-download').disabled = false;
-  $('btn-download-stl').disabled = false;
-
-  const status = $('scene-status');
-  status.textContent = payload.computed ? 'computed' : 'not computed';
-  status.className = `pill ${payload.computed ? 'pill-ok' : 'pill-muted'}`;
-
-  viewport.update(state.scene);
-  // Until a fairing is generated the hull *is* the payload, so showing both
-  // would just draw the same mesh twice, one ghosted over the other.
-  viewport.setHullTransparent(Boolean(state.hasPayload && state.scene.fairing));
-  $('btn-analyze').disabled = !state.hasPayload;
-  renderGeometry();
-  renderReynoldsNote();
-  renderSolverList();
-  renderCandidates();
-  renderEta();
-  renderResults();
-  updateRunButton();
-}
-
-async function loadPayloadMesh() {
-  // The server frames the payload on the *hull's* centroid so one transform
-  // places both, which means this must be re-fetched whenever the hull changes.
-  if (!state.hasPayload || !state.scene?.fairing) { viewport.setPayload(null); return; }
-  try {
-    const response = await api('/api/scene/payload-mesh');
-    viewport.setPayload(await response.arrayBuffer());
-  } catch (error) { viewport.setPayload(null); }
-}
-
-async function refreshRanking() {
-  try {
-    const payload = await api('/api/fairing/ranking');
-    state.ranking = payload.ranking || [];
-  } catch (error) { state.ranking = []; }
-  renderRanking();
-  renderCandidates();
-}
-
-async function loadSceneFresh(payload) {
-  adoptScene(payload);
-  await loadMesh();
-  await loadPayloadMesh();
-  viewport.refit();
-  viewport.update(state.scene);
-}
-
-/* ------------------------------------------------------------------ run */
-
-async function startRun() {
-  try {
-    $('run-log').hidden = false;
-    $('run-log').textContent = 'starting…';
-    const payload = await api('/api/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ backends: state.scene.solver.backends }),
-    });
-    state.job = payload.job;
-    updateRunButton();
-    pollJob();
-  } catch (error) {
-    toast(`Could not start: ${error.message}`, true);
-    $('run-log').hidden = true;
-  }
-}
-
-function renderRunLog(job) {
   const log = $('run-log');
-  const lines = job.events
-    .filter((event) => event.message)
-    .map((event) => event.message);
+  const lines = (job?.events || []).filter((event) => event.message).map((event) => event.message);
   log.textContent = lines.join('\n');
   log.scrollTop = log.scrollHeight;
 }
 
+/* ------------------------------------------------------------ action bar */
+
+function renderActions() {
+  const run = state.run;
+  $('actionbar').hidden = !run;
+  if (!run) return;
+
+  const compute = $('btn-compute');
+  const derive = $('btn-derive');
+  const text = $('actionbar-text');
+  const right = $('actionbar-right');
+  text.textContent = '';
+  right.textContent = '';
+
+  const busyElsewhere = Boolean(state.runningId && state.runningId !== run.id);
+  const isRunning = run.status === 'running';
+  const isShape = run.kind === 'shape';
+
+  compute.textContent = isShape ? 'Compute drag on the shell' : 'Compute drag';
+  derive.textContent = isShape ? 'Derive again' : 'Derive a lower-drag shape';
+
+  const noBackends = (run.scene.solver.backends || []).length === 0;
+  compute.disabled = isRunning || busyElsewhere || noBackends || (isShape && !run.shell);
+  derive.disabled = isRunning || busyElsewhere;
+
+  if (isRunning) {
+    compute.textContent = 'Solving…';
+    text.append(document.createTextNode('This run is working. '));
+    text.append(el('b', null, 'Its parameters are frozen; every other tab stays live.'));
+  } else if (busyElsewhere) {
+    const busy = state.runs.find((item) => item.id === state.runningId);
+    text.append(document.createTextNode('One solve at a time — '));
+    text.append(el('b', null, busy ? busy.title : 'another run'));
+    text.append(document.createTextNode(' is running. Reading and editing this run is unaffected.'));
+  } else if (noBackends) {
+    text.append(document.createTextNode('Select at least one solver on the left.'));
+  } else if (isShape) {
+    text.append(document.createTextNode(
+      run.shell
+        ? 'Opens the shell as its own run and solves it. Deriving again re-wraps the same payload. '
+        : 'Build the shell first. ',
+    ));
+    text.append(el('b', null, 'This run stays as it is.'));
+  } else if (run.results?.runs?.length) {
+    text.append(document.createTextNode('Opens a new run carrying '));
+    text.append(el('b', null,
+      run.changed?.length
+        ? `your ${run.changed.length} changed parameter${run.changed.length === 1 ? '' : 's'}`
+        : 'the same parameters'));
+    text.append(document.createTextNode('. This one is kept.'));
+  } else {
+    text.append(document.createTextNode('Solves into this run, '));
+    text.append(el('b', null, run.title));
+    text.append(document.createTextNode(' — it has no results to overwrite yet.'));
+  }
+
+  if (isRunning) {
+    const job = state.job && state.job.run_id === run.id ? state.job : null;
+    right.append(el('span', 'glyph glyph-running'));
+    if (job?.progress) {
+      right.append(document.createTextNode(`${job.progress.units_done}/${job.progress.units_total} solves · `));
+      right.append(el('strong', null, `~${job.progress.remaining_text} left`));
+    } else {
+      right.append(document.createTextNode('starting…'));
+    }
+  } else if (run.estimate && !isShape) {
+    right.append(el('strong', null, `~${formatDuration(run.estimate.total_seconds)}`));
+    right.append(document.createTextNode(
+      run.estimate.calibrated
+        ? ` estimated, from ${run.estimate.samples} past solves`
+        : ' estimated (uncalibrated)',
+    ));
+  }
+}
+
+/* -------------------------------------------------------------- viewport */
+
+function renderLegend() {
+  const host = $('view-legend');
+  host.textContent = '';
+  const run = state.run;
+  if (!run) return;
+
+  // The shape is named where the eyes already are, so "which one is this?"
+  // never needs the panel.
+  const shapeKey = el('span', 'key');
+  const isShell = run.kind === 'shape' && Boolean(run.shell);
+  shapeKey.append(el('i', `swatch ${run.kind === 'shape' && !isShell ? 'swatch-payload' : 'swatch-hull'}`));
+  shapeKey.append(document.createTextNode(
+    run.kind === 'shape'
+      ? (isShell ? `Shell — ${run.title}` : `Payload — ${run.scene.geometry.source_name}`)
+      : `Shape — ${run.scene.geometry.source_name}`,
+  ));
+  host.append(shapeKey);
+
+  if (run.show_payload) {
+    const payloadKey = el('span', 'key');
+    payloadKey.append(el('i', 'swatch swatch-payload'), document.createTextNode('Payload'));
+    host.append(payloadKey);
+  }
+
+  const windKey = el('span', 'key');
+  windKey.append(el('i', 'swatch swatch-wind'), document.createTextNode('Wind'));
+  host.append(windKey);
+
+  if (run.scene.road.enabled) {
+    const roadKey = el('span', 'key');
+    roadKey.append(el('i', 'swatch swatch-road'), document.createTextNode('Road'));
+    host.append(roadKey);
+  }
+}
+
+/* The mesh only travels when it actually changed: switching tabs, adopting a
+   shell, or a shape run finishing. Everything else is a transform the browser
+   applies itself. */
+function meshKeyFor(run) {
+  if (!run) return null;
+  return [run.id, run.scene.geometry.source_name, run.shell_source || '', run.status].join('|');
+}
+
+async function loadMeshes(force = false) {
+  const run = state.run;
+  if (!run) { viewport.clearAll(); state.meshKey = null; return; }
+
+  const key = meshKeyFor(run);
+  if (!force && key === state.meshKey) return;
+
+  try {
+    const response = await api(`/api/runs/${run.id}/mesh`);
+    viewport.setHull(await response.arrayBuffer());
+    viewport.setHullTransparent(Boolean(run.show_payload));
+    viewport.refit();
+
+    if (run.show_payload) {
+      try {
+        const payload = await api(`/api/runs/${run.id}/payload-mesh`);
+        viewport.setPayload(await payload.arrayBuffer());
+      } catch (error) { viewport.setPayload(null); }
+    } else {
+      viewport.setPayload(null);
+    }
+    viewport.update(run.scene);
+    state.meshKey = key;
+  } catch (error) {
+    toast(`Could not load the shape: ${error.message}`, true);
+  }
+}
+
+/* ------------------------------------------------------------ rendering */
+
+function render() {
+  const run = state.run;
+
+  renderTabs();
+  renderRunHead();
+  renderChangedNote();
+  renderShapeFacts();
+  renderGeometry();
+  renderReynoldsNote();
+  renderSolverList();
+  renderProcesses();
+  renderProgress();
+  renderResults();
+  renderShell();
+  renderAsRun();
+  renderActions();
+  renderLegend();
+
+  const isShape = run?.kind === 'shape';
+  $('packaging-block').hidden = !isShape;
+  $('solver-block').hidden = !run || isShape;
+  for (const block of document.querySelectorAll('.param-block')) {
+    block.hidden = !run || (isShape && block.id === 'solver-block');
+  }
+  $('freeze-block').hidden = run?.status !== 'running';
+  $('empty-results').hidden = Boolean(
+    !run || run.status === 'running' || run.status === 'failed'
+    || (run.kind === 'drag' && run.results?.runs?.length)
+    || (run.kind === 'shape' && run.shell),
+  );
+  if (!$('empty-results').hidden) {
+    $('empty-results-hint').textContent = isShape
+      ? 'Deriving builds the single-body shell here, from the payload on the left.'
+      : 'Compute drag fills this panel in. The parameters on the left are the ones it will use.';
+  }
+
+  $('btn-download').disabled = !run;
+  $('btn-download-stl').disabled = !run;
+  lockControls(run ? run.status === 'running' : true);
+}
+
+function adoptRun(payload, options = {}) {
+  state.run = payload;
+  state.activeId = payload.id;
+  if (!options.skipControls) {
+    applyControls(payload.scene);
+    $('quality-select').value = payload.scene.solver.quality || 'balanced';
+  }
+  markChangedControls(payload.changed);
+  if (payload.job) state.job = payload.job;
+  render();
+  if (!options.keepCamera) viewport.update(payload.scene);
+}
+
+function adoptState(payload) {
+  state.runs = payload.runs || [];
+  state.solvers = payload.solvers || [];
+  state.cores = payload.cores || null;
+  state.runningId = payload.running_id || null;
+  state.runningJob = payload.running_job || null;
+  if (payload.active_id) state.activeId = payload.active_id;
+}
+
+/* -------------------------------------------------------------- actions */
+
+async function refreshState() {
+  adoptState(await api('/api/state'));
+  renderTabs();
+}
+
+async function selectRun(runId, options = {}) {
+  if (!runId) {
+    state.run = null;
+    state.activeId = null;
+    viewport.clearAll();
+    render();
+    return;
+  }
+  try {
+    const payload = await api(`/api/runs/${runId}`);
+    await api(`/api/runs/${runId}/activate`, { method: 'POST' });
+    state.activeId = runId;
+    adoptRun(payload);
+    await loadMeshes(options.forceMesh);
+    watchRunningJob();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function openRun(payload) {
+  adoptState(payload.state);
+  adoptRun(payload.run);
+  await loadMeshes();
+  render();
+}
+
+async function closeRun(runId) {
+  try {
+    const payload = await api(`/api/runs/${runId}`, { method: 'DELETE' });
+    adoptState(payload);
+    if (payload.active_id) await selectRun(payload.active_id);
+    else await selectRun(null);
+  } catch (error) { toast(error.message, true); }
+}
+
+/* One poll loop for whichever run is solving, so the tab bar keeps its
+   progress bar moving while you read a different run. The guard matters:
+   switching tabs calls this, and a second loop started while the first is
+   mid-fetch would double the polling rate for the rest of the solve. */
+function watchRunningJob() {
+  if (!state.runningJob || state.polling) return;
+  clearTimeout(state.jobTimer);
+  state.jobTimer = setTimeout(pollJob, 400);
+}
+
 async function pollJob() {
   clearTimeout(state.jobTimer);
-  if (!state.job) return;
+  const jobId = state.runningJob;
+  if (!jobId) return;
+
+  state.polling = true;
   try {
-    const job = await api(`/api/jobs/${state.job.id}`);
-    const kind = state.job.kind || job.kind;
+    const job = await api(`/api/jobs/${jobId}`);
     state.job = job;
-    renderRunLog(job);
-    renderEta();
 
     if (job.status === 'running') {
+      renderTabs();
+      if (job.run_id === state.activeId) { renderProgress(); renderActions(); }
+      state.polling = false;
       state.jobTimer = setTimeout(pollJob, 900);
       return;
     }
-    updateRunButton();
+
+    state.polling = false;
+    state.runningJob = null;
+    if (job.state) adoptState(job.state);
     if (job.status === 'failed') {
-      toast(job.error || 'Run failed', true);
-      renderEta();
-      return;
+      toast(job.error || 'The run failed', true);
+    } else {
+      toast(job.kind === 'shape' ? 'Shell ready' : 'Run complete');
     }
 
-    if (kind === 'fairing') {
-      state.fairing = job.results;
-      state.ranking = [];
-      renderCandidates();
-      renderRanking();
-      const count = job.results?.candidates?.length || 0;
-      toast(count ? `${count} candidate fairings ready` : 'No candidates found');
-    } else if (kind === 'compare') {
-      state.fairing = job.results;
-      await refreshRanking();
-      const fresh = await api('/api/scene');
-      adoptScene(fresh, { skipControls: true });
-      await loadMesh();
-      await loadPayloadMesh();
-      viewport.update(state.scene);
-      toast('Comparison complete — best design selected');
+    if (job.run && job.run.id === state.activeId) {
+      adoptRun(job.run);
+      await loadMeshes();
     } else {
-      if (job.scene) adoptScene(job.scene, { skipControls: true });
-      toast('Run complete');
+      await refreshState();
     }
-    renderEta();
+    render();
   } catch (error) {
     toast(`Lost the run: ${error.message}`, true);
+    state.polling = false;
+    state.runningJob = null;
     state.job = null;
-    updateRunButton();
-    renderEta();
+    render();
   }
+}
+
+async function startCompute() {
+  let run = state.run;
+  if (!run) return;
+  try {
+    // A shape run holds geometry, not drag. Computing from one is really two
+    // steps -- open the shell as its own run, then solve that -- so do both
+    // rather than making the obvious button the wrong one.
+    if (run.kind === 'shape') {
+      const opened = await api(`/api/runs/${run.id}/adopt`, { method: 'POST' });
+      adoptState(opened.state);
+      run = opened.run;
+      state.run = run;
+    }
+    const payload = await api(`/api/runs/${run.id}/compute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backends: run.scene.solver.backends }),
+    });
+    adoptState(payload.state);
+    state.runningJob = payload.job.id;
+    state.job = payload.job;
+    if (payload.forked) toast(`Solving as a new run: ${payload.run.title}`);
+    await selectRun(payload.run_id);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function startDerive() {
+  const run = state.run;
+  if (!run) return;
+  try {
+    const payload = await api(`/api/runs/${run.id}/derive`, { method: 'POST' });
+    adoptState(payload.state);
+    state.runningJob = payload.job.id;
+    state.job = payload.job;
+    toast('Searching for the smallest single-body shell');
+    await selectRun(payload.run_id);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function adoptShell() {
+  const run = state.run;
+  if (!run) return;
+  try {
+    const payload = await api(`/api/runs/${run.id}/adopt`, { method: 'POST' });
+    await openRun(payload);
+    toast(`Opened ${payload.run.title} — compute its drag to cost the shape`);
+  } catch (error) { toast(error.message, true); }
 }
 
 /* -------------------------------------------------------------- library */
@@ -1732,45 +1942,31 @@ async function refreshLibrary() {
   host.textContent = '';
 
   if (!payload.scenes.length) {
-    const empty = document.createElement('p');
-    empty.className = 'hint';
-    empty.textContent = 'No saved scenes yet.';
-    host.append(empty);
+    host.append(el('p', 'hint', 'Nothing saved yet.'));
     return;
   }
 
   for (const entry of payload.scenes) {
-    const row = document.createElement('div');
-    row.className = 'library-row';
+    const row = el('div', 'library-row');
+    const name = el('div');
+    name.append(el('div', 'library-name', entry.scene_name));
+    name.append(el('div', 'library-sub', `${entry.name} · ${entry.modified.replace('T', ' ')}`));
 
-    const name = document.createElement('div');
-    name.className = 'library-name';
-    name.textContent = entry.name;
-    const meta = document.createElement('div');
-    meta.className = 'library-meta';
-    meta.textContent = entry.modified.replace('T', ' ').replace('+00:00', ' UTC');
-    name.append(meta);
+    const pill = el('span', `pill ${entry.computed ? 'pill-ok' : 'pill-muted'}`,
+      entry.computed ? 'solved' : 'not solved');
 
-    const pill = document.createElement('span');
-    pill.className = `pill ${entry.computed ? 'pill-ok' : 'pill-muted'}`;
-    pill.textContent = entry.computed ? 'computed' : 'scene only';
-
-    const open = document.createElement('button');
-    open.className = 'btn';
-    open.textContent = 'Open';
+    const open = el('button', 'btn', 'Open as run');
     open.addEventListener('click', async () => {
       try {
-        const payloadScene = await api('/api/library/load', {
+        const loaded = await api('/api/library/open', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: entry.name }),
         });
-        await loadSceneFresh(payloadScene);
         $('library-modal').hidden = true;
+        await openRun(loaded);
         toast(`Opened ${entry.name}`);
-      } catch (error) {
-        toast(error.message, true);
-      }
+      } catch (error) { toast(error.message, true); }
     });
 
     row.append(name, pill, open);
@@ -1783,14 +1979,13 @@ async function refreshLibrary() {
 function wire() {
   for (const button of document.querySelectorAll('[data-sample]')) {
     button.addEventListener('click', async () => {
-      const name = button.dataset.sample;
       try {
-        await loadSceneFresh(await api('/api/scene/sample', {
+        await openRun(await api('/api/runs/sample', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name }),
+          body: JSON.stringify({ name: button.dataset.sample }),
         }));
-        toast(`Loaded the sample ${name} — compute its drag, or analyse packaging to fair it`);
+        toast('New run — compute its drag, or derive a shape around it');
       } catch (error) { toast(error.message, true); }
     });
   }
@@ -1801,8 +1996,8 @@ function wire() {
     const body = new FormData();
     body.append('file', file);
     try {
-      await loadSceneFresh(await api('/api/scene/stl', { method: 'POST', body }));
-      toast(`Imported ${file.name} — compute its drag, or analyse packaging to fair it`);
+      await openRun(await api('/api/runs/import', { method: 'POST', body }));
+      toast(`Imported ${file.name} as a new run`);
     } catch (error) { toast(error.message, true); }
     event.target.value = '';
   });
@@ -1813,85 +2008,75 @@ function wire() {
     const body = new FormData();
     body.append('file', file);
     try {
-      const payload = await api('/api/scene/file', { method: 'POST', body });
-      await loadSceneFresh(payload);
-      toast(payload.computed ? 'Imported a computed scene' : 'Imported a scene, not computed yet');
+      const payload = await api('/api/runs/open', { method: 'POST', body });
+      await openRun(payload);
+      toast(payload.run.results ? 'Opened a solved run' : 'Opened a run, not solved yet');
     } catch (error) { toast(error.message, true); }
     event.target.value = '';
   });
 
-  $('btn-analyze').addEventListener('click', async () => {
-    try {
-      $('run-log').hidden = false;
-      $('run-log').textContent = 'analysing…';
-      const payload = await api('/api/fairing/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      state.job = { ...payload.job, kind: 'fairing' };
-      updateRunButton();
-      pollJob();
-    } catch (error) { toast(error.message, true); }
-  });
-
-  $('btn-compare').addEventListener('click', async () => {
-    try {
-      $('run-log').hidden = false;
-      $('run-log').textContent = 'comparing…';
-      const payload = await api('/api/fairing/compare', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          backends: state.scene.solver.backends,
-          quality: $('quality-select').value,
-        }),
-      });
-      state.job = { ...payload.job, kind: 'compare' };
-      updateRunButton();
-      pollJob();
-    } catch (error) { toast(error.message, true); }
-  });
+  $('btn-compute').addEventListener('click', startCompute);
+  $('btn-derive').addEventListener('click', startDerive);
+  $('btn-adopt').addEventListener('click', adoptShell);
 
   $('quality-select').addEventListener('change', async (event) => {
+    if (!state.run) return;
     try {
-      const payload = await api('/api/quality', {
+      adoptRun(await api(`/api/runs/${state.run.id}/quality`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ quality: event.target.value }),
-      });
-      adoptScene(payload);
+      }));
     } catch (error) { toast(error.message, true); }
   });
 
   $('processes-input').addEventListener('change', async (event) => {
+    if (!state.run) return;
     // Blank means "decide from this machine" rather than zero ranks, so it is
     // sent through as null and the server clears the override.
     const raw = event.target.value.trim();
-    const processes = raw === '' ? null : Number(raw);
     try {
-      const payload = await api('/api/processes', {
+      adoptRun(await api(`/api/runs/${state.run.id}/processes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ processes }),
-      });
-      adoptScene(payload);
-      await refreshSolvers();
+        body: JSON.stringify({ processes: raw === '' ? null : Number(raw) }),
+      }));
+      await refreshState();
+      renderSolverList();
     } catch (error) {
       toast(error.message, true);
       renderProcesses();
     }
   });
 
-  $('btn-download').addEventListener('click', () => { window.location.href = '/api/scene/download'; });
-  $('btn-download-stl').addEventListener('click', () => { window.location.href = '/api/scene/hull.stl'; });
+  const saveMeta = async () => {
+    if (!state.run) return;
+    try {
+      const payload = await api(`/api/runs/${state.run.id}/meta`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: $('run-title').value,
+          description: $('run-description').value,
+        }),
+      });
+      adoptRun(payload, { skipControls: true, keepCamera: true });
+      await refreshState();
+    } catch (error) { toast(error.message, true); }
+  };
+  $('run-title').addEventListener('change', saveMeta);
+  $('run-description').addEventListener('change', saveMeta);
 
-  $('result-title').addEventListener('change', saveResultMeta);
-  $('result-description').addEventListener('change', saveResultMeta);
+  $('btn-download').addEventListener('click', () => {
+    if (state.run) window.location.href = `/api/runs/${state.run.id}/download`;
+  });
+  $('btn-download-stl').addEventListener('click', () => {
+    if (state.run) window.location.href = `/api/runs/${state.run.id}/hull.stl`;
+  });
 
   $('btn-library').addEventListener('click', async () => {
     $('library-modal').hidden = false;
-    $('library-name').value = state.scene ? state.scene.name : '';
+    $('library-name').value = state.run ? state.run.title.split(' · ')[0] : '';
     try { await refreshLibrary(); } catch (error) { toast(error.message, true); }
   });
   $('btn-library-close').addEventListener('click', () => { $('library-modal').hidden = true; });
@@ -1899,53 +2084,37 @@ function wire() {
     if (event.target === $('library-modal')) $('library-modal').hidden = true;
   });
 
-  const save = async () => {
-    if (!state.scene) return;
+  $('btn-library-save').addEventListener('click', async () => {
+    if (!state.run) return;
     try {
-      const name = $('library-name').value || state.scene.name;
+      const name = $('library-name').value || state.run.title;
       await api('/api/library/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ run_id: state.run.id, name }),
       });
       await refreshLibrary();
       toast(`Saved ${name}`);
     } catch (error) { toast(error.message, true); }
-  };
-  $('btn-library-save').addEventListener('click', save);
-  $('btn-save').addEventListener('click', async () => {
-    $('library-modal').hidden = false;
-    $('library-name').value = state.scene ? state.scene.name : '';
-    await refreshLibrary();
-  });
-
-  $('scene-name').addEventListener('change', (event) => {
-    if (!state.scene) return;
-    pendingPatch.name = event.target.value;
-    state.scene.name = event.target.value;
-    flushPatch();
   });
 
   $('btn-reset-attitude').addEventListener('click', () => {
-    for (const key of ['yaw_deg', 'pitch_deg', 'roll_deg']) pushControl('orientation', key, 0);
-    applyControls(state.scene);
+    for (const key of ['yaw_deg', 'pitch_deg', 'roll_deg']) {
+      controlRegistry.orientation[key].apply(0);
+      pushControl('orientation', key, 0);
+    }
   });
-
-  $('btn-run').addEventListener('click', startRun);
 
   $('btn-view-chart').addEventListener('click', () => setResultView('chart'));
   $('btn-view-table').addEventListener('click', () => setResultView('table'));
-  window.addEventListener('hashchange', () => {
-    setResultView(location.hash === '#table' ? 'table' : 'chart');
-  });
 
   window.addEventListener('resize', () => {
-    if (state.resultView === 'chart') drawCharts();
+    drawCharts();
     drawSweepChart();
   });
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-    renderResults();
-    if (state.scene) viewport.update(state.scene);
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') $('library-modal').hidden = true;
   });
 }
 
@@ -1953,33 +2122,19 @@ function wire() {
 
 async function boot() {
   buildControls();
+  wire();
   setupChartHover('force');
   setupChartHover('cd');
-  wire();
-  if (location.hash === '#table') state.resultView = 'table';
+  setResultView(location.hash === '#table' ? 'table' : 'chart');
 
   try {
-    const payload = await api('/api/solvers');
-    state.solvers = payload.solvers;
-    state.cores = payload.cores || null;
+    await refreshState();
+    if (state.activeId) await selectRun(state.activeId);
+    else render();
+    watchRunningJob();
   } catch (error) {
-    state.solvers = [];
-    state.cores = null;
+    toast(`Could not reach the server: ${error.message}`, true);
   }
-  renderSolverList();
-  renderProcesses();
-
-  try {
-    const payload = await api('/api/scene');
-    if (payload && payload.scene) {
-      await loadSceneFresh(payload);
-      // A comparison from an earlier visit is still on the server; show its
-      // ranking rather than making the user re-run to see it.
-      if ((state.fairing?.candidates || []).some((item) => item.results)) await refreshRanking();
-    }
-  } catch (error) { /* nothing loaded yet is normal */ }
-
-  updateRunButton();
 }
 
 boot();

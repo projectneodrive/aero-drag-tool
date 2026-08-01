@@ -306,7 +306,7 @@ def command_export(args: argparse.Namespace) -> int:
 
 
 def command_fair(args: argparse.Namespace) -> int:
-    """Payload STL in, candidate fairings out, one scene file each."""
+    """Payload STL in, one single-body shell out, as a scene ready to solve."""
     import fairing as fairing_module
     from scene import FairingSpec, Geometry
 
@@ -330,74 +330,73 @@ def command_fair(args: argparse.Namespace) -> int:
         grid, anisotropy=args.anisotropy, clearance=args.clearance,
         progress=lambda event: print(f"  {event['message']}"),
     )
-    print("\nTopology plateaus (wider is a more robust design):")
-    for plateau in result.plateaus:
+    if result.merge_radius is None:
         print(
-            f"  {plateau.components} bodies for r in "
-            f"[{plateau.radius_min * 1000:.0f}, {plateau.radius_max * 1000:.0f}] mm "
-            f"-> pick r = {plateau.radius * 1000:.0f} mm"
+            "\nThe payload never closes into a single body within the grid. Raise "
+            "--anisotropy or --clearance, which both bridge gaps sooner."
         )
+        for warning in grid.warnings:
+            print(f"! {warning}")
+        return 1
+
+    print(
+        f"\n{result.bodies_at_zero} separate bodies uncovered, merging into one at "
+        f"r = {result.merge_radius * 1000:.0f} mm."
+    )
 
     # The skin grid gets the streamwise room the nose and tail cones need;
-    # the sweep grid above does not, since topology needs no tail.
+    # the sweep grid above does not, since merging needs no tail.
     fine = fairing_module.build_grid(
         payload_mesh, direction=direction, resolution=args.resolution,
         anisotropy=args.anisotropy, streamline=streamline, clearance=args.clearance,
     )
-    candidates = fairing_module.candidates_from_sweep(
+    shell = fairing_module.build_single_shell(
         grid, payload_mesh, result, direction=direction,
-        clearance=args.clearance, limit=args.limit,
+        clearance=args.clearance,
         progress=lambda event: print(f"  {event['message']}"),
         build_grid_override=fine, streamline=streamline,
     )
-    candidates.sort(key=lambda item: -item.components)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print()
+    scene.geometry = Geometry.from_bytes(
+        shell.mesh.export(file_type="stl"), source_name=f"{payload_path.stem}_shell.stl"
+    )
+    scene.fairing = FairingSpec(
+        closing_radius=shell.radius,
+        clearance=shell.clearance,
+        anisotropy=shell.anisotropy,
+        components=1,
+        resolution=args.resolution,
+        streamlined=shell.streamlined,
+        nose_angle_deg=shell.nose_angle_deg,
+        tail_angle_deg=shell.tail_angle_deg,
+    )
+    scene.name = f"{payload_path.stem}_shell"
 
-    for candidate in candidates:
-        variant = scene.copy()
-        variant.geometry = Geometry.from_bytes(
-            candidate.mesh.export(file_type="stl"),
-            source_name=f"fairing_{candidate.components}body.stl",
-        )
-        variant.fairing = FairingSpec(
-            closing_radius=candidate.radius,
-            clearance=candidate.clearance,
-            anisotropy=args.anisotropy,
-            components=candidate.components,
-            plateau_width=candidate.plateau_width,
-            streamlined=candidate.streamlined,
-            nose_angle_deg=candidate.nose_angle_deg,
-            tail_angle_deg=candidate.tail_angle_deg,
-        )
-        variant.name = f"{payload_path.stem}_{candidate.components}body"
-        path = output_dir / f"{variant.name}.aero.json"
-        variant.save(path)
+    output = Path(args.output) if args.output else Path(f"{scene.name}.aero.json")
+    scene.save(output)
 
-        flags = []
-        if candidate.contains_payload is False:
-            flags.append("PAYLOAD STICKS OUT")
-        elif candidate.contains_payload is None:
-            flags.append("fit unchecked")
-        if candidate.choked:
-            flags.append(f"choked gap {candidate.min_gap * 1000:.0f} mm")
-        suffix = f"  [{', '.join(flags)}]" if flags else ""
-        shape = (
-            f"streamlined, tail {candidate.tail_angle_deg:.0f} deg"
-            if candidate.streamlined
-            else "raw closing skin"
-        )
-        print(
-            f"{path}\n  {candidate.components} bodies, r = {candidate.radius * 1000:.0f} mm, "
-            f"{shape}, frontal area {candidate.frontal_area:.4f} m^2{suffix}"
-        )
+    shape = (
+        f"streamlined, tail {shell.tail_angle_deg:.0f} deg"
+        if shell.streamlined
+        else "raw closing skin"
+    )
+    print(f"\nWrote {output}")
+    print(f"  closing radius : {shell.radius * 1000:.0f} mm ({shape})")
+    print(f"  frontal area   : {shell.frontal_area:.4f} m^2")
+    print(f"  volume         : {'-' if shell.volume is None else f'{shell.volume:.4f} m^3'}")
+    print(f"  bodies         : {shell.bodies}")
+    print(f"  watertight     : {shell.watertight}")
+    print(
+        "  payload fit    : "
+        + {True: "encloses", False: "STICKS OUT", None: "unverified"}[shell.contains_payload]
+    )
 
+    if shell.bodies > 1:
+        print("\n! The shell is still in pieces. Raise --anisotropy or --clearance.")
     for warning in list(grid.warnings) + list(fine.warnings):
         print(f"\n! {warning}")
 
-    print(f"\nCompute them with:  python src/runner.py run <name>.aero.json  (in {output_dir})")
+    print(f"\nCompute it with:  python src/runner.py run {output}")
     return 0
 
 
@@ -479,13 +478,14 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("scene")
     show.set_defaults(handler=command_show)
 
-    fair = subparsers.add_parser("fair", help="Generate candidate fairings around a payload STL")
+    fair = subparsers.add_parser(
+        "fair", help="Wrap a payload STL in a single-body fairing"
+    )
     fair.add_argument("--payload", required=True, help="Payload STL: what has to fit inside")
-    fair.add_argument("--output_dir", default="candidates", help="Where to write the candidate scenes")
+    fair.add_argument("-o", "--output", help="Scene file to write (default <payload>_shell.aero.json)")
     fair.add_argument("--clearance", type=float, default=0.03, help="Gap between payload and skin (m)")
     fair.add_argument("--anisotropy", type=float, default=3.0, help="Streamwise bias of the closing")
     fair.add_argument("--resolution", type=int, default=128, help="Voxel resolution for the skin")
-    fair.add_argument("--limit", type=int, default=4, help="Maximum candidates to build")
     fair.add_argument(
         "--nose-angle", type=float, default=45.0,
         help="Nose growth limit in degrees from the flow axis (blunter is shorter)",

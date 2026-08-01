@@ -15,81 +15,107 @@ python src/server.py           # opens http://127.0.0.1:8000
 The application lives in `src/`; the repository root holds only the README,
 dependencies, the SU2 install script and the two sample STLs.
 
-![The GUI: packaging inputs and fairing candidates on the left, the scene in the
-middle, actions and results on the right](docs/screenshot.png)
+![The GUI: one tab per run, this run's parameters on the left, the scene in the
+middle, its results on the right](docs/screenshot.png)
 
-Above: the bundled **Sample trike** (`sample2.stl`, orange) inside the merged
-single-shell fairing the tool proposed for it, with the drag force and drag
-coefficient curves from a four-speed OpenFOAM sweep. Two samples ship with the
-tool: `sample.stl` is a unit cube, useful because its Cd is known and easy to
-check; `sample2.stl` is a mock tadpole trike -- a reclined rider envelope plus
-three wheels -- whose four separate bodies are what the packaging sweep is for.
+Two samples ship with the tool: `sample.stl` is a unit cube, useful because its
+Cd is known and easy to check; `sample2.stl` is a mock tadpole trike -- a
+reclined rider envelope plus three wheels -- whose four separate bodies are what
+the shape search exists for.
 
-## From a payload STL to a hull, without needing to know CFD
+## Runs
 
-There is one import path. **Import STL** (or **Sample cube**) loads a shape as
-both the hull and the payload, and what happens next is the button you press:
-**Compute drag** flies it as-is, **Analyse packaging** treats it as the thing a
-fairing has to enclose.
+The unit of work is a **run**: one shape, the parameters it was given, and the
+results that came back. Every tab is one. A run stops changing once it has been
+solved, so the history *is* the record — every number on screen can be traced to
+the exact inputs that produced it, and a run you solved an hour ago still says
+what it said then.
 
-The shortest path to a hull:
+That single rule settles the questions a mutable "current scene" leaves open:
 
-1. **Import STL** — whatever has to fit inside: rider, wheels, battery.
-2. **Analyse packaging** — sweeps a closing radius, proposes one fairing per
-   stable topology, and streamlines each into the smallest taper-bounded body
-   that encloses the payload (verified with a real containment test).
-3. **Compare designs** — runs every candidate through the solvers at the
-   screening preset and ranks them by drag area.
-4. The winner is selected for you, with its own drag curve. Switch to
-   **Accurate** and **Compute drag** to confirm it properly, then
-   **Download hull STL**.
+- **Editing a solved run does not rewrite it.** Change the wind speed
+  afterwards and the knob is flagged with the value the run was actually solved
+  at, next to a way back. The curve stays on screen — it is still a real
+  measurement — but never without saying what it belongs to.
+- **Computing forks.** In a fresh draft, **Compute drag** solves into that run.
+  In a solved one it opens a *new* run carrying your edits, auto-titled and
+  auto-described (`Re-run of trike · drag #1 with a different wind speed`).
+- **The freeze is per run.** Only the working run locks its parameters. Every
+  other tab stays fully readable and editable while the solver grinds, and the
+  solving tab keeps a progress bar under its label so you can watch it from
+  anywhere.
+- **Every run says where its shape came from.** The lineage line under the
+  title names the parent — an imported file, or the shell of a shape run — so
+  the chain from payload to final hull is always readable.
 
-Every computation is titled automatically from the scene name and the operation
-(`payload · drag #2`), and both the title and its description are editable.
-While a solver runs, every parameter is locked, so the values on screen are
-always the ones the running job was given.
+There are two verbs, in a bar that spans the run they act on:
 
-### How it decides one lump or several
+| | |
+|---|---|
+| **Compute drag** | solve this run's shape at these conditions |
+| **Derive a lower-drag shape** | wrap this run's shape in a single-body fairing, as a new run |
 
-"Should the wheels get their own pods or disappear into one shell?" is not a
-discrete choice — it is a **length scale**. Two lumps are one body when the gap
-between them is small compared to the skin you would wrap around them.
+So the loop is: import an STL, compute its drag for a baseline, derive a shape
+around it, open that shell as its own run, compute *its* drag — and because the
+new run knows its parent, the headline number is shown as a change
+(`Cd·A 0.288 m², −16.1% vs trike · drag #1`). That is the number the loop
+exists to move. Repeat as needed; nothing you did earlier is overwritten.
 
-So the tool sweeps that scale. A morphological closing (dilate by r, erode by r)
-hugs each lump at small r and bridges the gaps at large r; the topology changes
-on its own. Plot the number of separate bodies against r and you get a
-staircase — and **the flat runs are the candidate designs**. A wide plateau is a
-robust topology; a narrow one is two parts happening to nearly touch.
+## The fairing is always a single closed shell
 
-Two things make it aerodynamic rather than merely geometric:
+Separate pods around separate lumps are not offered, and there is no choice of
+body count. The gap between two pods is a channel with a boundary layer off
+both walls — usually worse than the solid bridge it was avoiding, and it needs
+cells finer than the gap to mesh at all. So the only question left is *how much
+closing it takes* to reach one body, which is a length scale rather than a
+decision.
+
+A morphological closing (dilate by r, erode by r) hugs each lump at small r and
+bridges the gaps at large r. The component count is monotone non-increasing in
+r, so there is exactly one threshold radius where the payload first becomes a
+single body, and every radius above it also works. The tool **bisects for that
+threshold** and builds just above it: enough closing to merge, and no more,
+because every millimetre past it is frontal area bought for nothing. On the
+sample trike that lands at 67 mm, where the old pick-a-plateau approach used
+100 mm and paid 2% more frontal area for it.
+
+Two things make the merge aerodynamic rather than merely geometric:
 
 - The closing is **anisotropic**, stretched along the flow. Two lumps in line
   merge far more readily than two side by side, because bridging in-line lumps
   costs almost no frontal area while bridging spanwise ones fills the whole span.
-- Candidates whose bodies come within ~6% of the hull length are flagged
-  **choked**: a narrow channel is high velocity with a boundary layer off both
-  walls, often worse than the solid bridge you were avoiding, and it needs cells
-  finer than the gap to mesh at all.
+- The clearance counts in the sweep too. Offsetting the skin outward is itself a
+  dilation, so it merges any bodies closer than twice the clearance — which
+  means the topology worth counting is the skin's, not the closed set's.
 
 The skin itself is the clearance level set of a signed distance field, so the
 payload gap is exact by construction and the surface is smooth to sub-voxel
-precision. Every candidate is then re-checked with a real containment test.
+precision. The field is Gaussian-filtered before the surface is extracted:
+distance fields computed from binary voxels carry staircase ripples at the
+pitch scale, and filtering the *field* removes them at the source — a Gaussian
+preserves linear fields exactly, so flat and gently curved regions do not move
+at all — where smoothing the extracted *mesh* could only polish triangle by
+triangle.
 
-The clearance counts in the sweep too. Offsetting the skin outward is itself a
-dilation, so it merges any bodies closer than twice the clearance -- which means
-the topology worth counting is the skin's, not the closed set's. Count the
-closed set and the tool proposes candidates the builder cannot actually make.
+**The built shell is then verified, not assumed.** The sweep runs on a coarse
+grid because counting components tolerates a blurry payload, while the skin is
+built on a fine one that resolves narrow gaps the sweep blurred shut — so the
+threshold it found can still come out in pieces. The tool splits the built mesh,
+counts the bodies, and opens the radius until it really is one, reporting how
+many attempts it took. A two-piece "single shell" would mesh into a choked
+channel and report a drag coefficient for a shape nobody chose. Containment is
+re-checked against the payload the same way.
 
 ### From packaging skin to a body you would fly
 
-The closing decides *topology*, never *profile*: it is bounded by the convex
-hull, so on a convex payload it does nothing at all, and the skin would come
-out as the payload plus clearance — a rounded cube for a cube. Nothing in
-"wrap this as tightly as possible" ever grows a tail, because a tail is volume
-the payload does not need.
+The closing decides *whether it is one body*, never the *profile*: it is bounded
+by the convex hull, so on a convex payload it does nothing at all, and the skin
+would come out as the payload plus clearance — a rounded cube for a cube.
+Nothing in "wrap this as tightly as possible" ever grows a tail, because a tail
+is volume the payload does not need.
 
-So a second stage grows one deliberately. Each candidate skin is the **minimal
-taper-bounded envelope** of its closed set: the smallest body whose
+So a second stage grows one deliberately. The skin is the **minimal
+taper-bounded envelope** of the closed set: the smallest body whose
 cross-sections never grow steeper than the nose angle (45° by default) and
 never shrink steeper than the tail angle (12°) along the flow. Those two
 limits are the whole of classical streamlining — a tail shallow enough to keep
@@ -100,26 +126,34 @@ teardrop out: fineness ratio ~3.7, frontal area unchanged, with the tail
 length set by the taper limit rather than by taste.
 
 The envelope also fairs in-line bodies into each other automatically — the
-leading body's tail cone reaches the trailing body's nose — which is why the
-component count is recounted from the built mesh rather than trusted from the
-plateau. What the taper limit *costs* (wetted area, hence friction) versus
-what it saves (pressure drag) is not decided here: that is exactly the
-question the Cd·A comparison answers. Tweak the angles or disable the stage
-entirely (`--no-streamline`, or the packaging checkbox in the GUI) to see the
-difference in numbers.
+leading body's tail cone reaches the trailing body's nose — which helps the
+merge rather than hindering it, and is another reason the body count is taken
+from the built mesh rather than trusted from the sweep. What the taper limit
+*costs* (wetted area, hence friction) versus what it saves (pressure drag) is
+not decided here: solve the shell and compare its Cd·A against the payload's.
+Tweak the angles or disable the stage entirely (`--no-streamline`, or the
+checkbox in the GUI's shape search) to see the difference in numbers.
 
-**Ranking is by Cd·A, not Cd.** On a mock rider-and-wheels payload the merged
-shell posts the *lowest* Cd (0.603 against 0.623) and still loses, because its
-frontal area is 8% larger. Ranking on the coefficient alone picks the wrong
-design.
+**Compare by Cd·A, not Cd.** A shape can post a flattering coefficient purely by
+being bigger, since Cd is normalised by the frontal area it is quoted on. On the
+mock trike the shell's Cd is comfortably below the bare payload's and it still
+has to earn that against 60% more frontal area — which is exactly why the delta
+tile reports drag area rather than the coefficient.
 
 ## What the GUI does
 
-**Scene view.** The hull as loaded from STL, the wind as an arrow arriving from
-upstream, and the road as a plane at z = 0 with a grid at hull-length spacing.
-Orbit with the left mouse button, zoom with the wheel, pan with the right.
+**Tabs.** One per run, with a glyph that carries two things at once: hue is the
+kind (blue solves drag, orange derives shapes) and fill is the state, so a
+glance at the bar answers what is open and what it is doing. A solving run keeps
+a progress bar under its label from every tab. Close one with the ×; open a new
+one with **+**, **Import STL** or the **Library**.
 
-**Editing.** Wind speed, azimuth and elevation; hull yaw, pitch and roll; ride
+**Scene view.** The shape as loaded from STL, the wind as an arrow arriving from
+upstream, and the road as a plane at z = 0 with a grid at hull-length spacing.
+Orbit with the left mouse button, zoom with the wheel, pan with the right. The
+legend names the shape, so "which one am I looking at" never needs the panel.
+
+**Editing.** Wind speed, azimuth and elevation; yaw, pitch and roll; ride
 height above the road; and the road itself, which can be switched off entirely
 or made to slide at free-stream speed. Air density and viscosity are editable
 too. The frontal area updates as you drag, because it depends on the wind angle.
@@ -132,10 +166,14 @@ relationship that is not in the data.) The table lists Cd per speed beside the
 force. Points the solver actually computed are drawn filled; points
 extrapolated from one solve are hollow.
 
-**Scene files.** One JSON document holds the STL (embedded), the flow setup and
-the results. A scene that has not been computed and one that has are the same
-kind of file and open the same way, so you can build a case here, compute it on
-another machine, and open the result back in the GUI.
+**As run.** Under the results, an immutable record of the shape, flow and
+solver settings the numbers came from — separate from the editable title above
+it, and the thing that makes editing a solved run safe.
+
+**Run files.** One JSON document holds the STL (embedded), the flow setup and
+the results. A run that has not been solved and one that has are the same kind
+of file and open the same way, so you can build a case here, compute it on
+another machine, and open the result back as a run.
 
 ## Frontal area, and why the old number was wrong
 
@@ -176,8 +214,11 @@ python src/runner.py show case.aero.json
 python src/runner.py export case.aero.json --dir cases/    # ready-to-run solver cases
 
 # The whole design loop, headless:
-python src/runner.py fair --payload rider_and_wheels.stl --output_dir candidates/
-python src/runner.py compare candidates/*.aero.json --quality screening
+python src/runner.py new --stl rider_and_wheels.stl -o baseline.aero.json
+python src/runner.py run baseline.aero.json                       # the payload's own drag
+python src/runner.py fair --payload rider_and_wheels.stl -o shell.aero.json
+python src/runner.py run shell.aero.json                          # the shell's
+python src/runner.py compare baseline.aero.json shell.aero.json   # ranked by Cd·A
 ```
 
 `src/drag.py` is the SU2-flavoured entry point: the same CLI with SU2 selected
@@ -185,17 +226,18 @@ by default.
 
 ### Computing offline
 
-The GUI's **Save** writes into `scenes/`. Those are plain scene files:
+The GUI's **Library → Save this run** writes into `scenes/`. Those are plain
+scene files:
 
 ```bash
 # on the machine that has the solvers
 python src/runner.py run scenes/case.aero.json -o scenes/case.solved.json
 ```
 
-Open the solved file back in the GUI with **Import scene** and the results
-appear. `runner.py export` is the escape hatch when you would rather drive the
-solvers by hand: it writes a complete OpenFOAM case and a complete SU2 case,
-each with an `Allrun` script.
+Open the solved file back in the GUI with **Open run file** and it appears as a
+run with its results in place. `runner.py export` is the escape hatch when you
+would rather drive the solvers by hand: it writes a complete OpenFOAM case and a
+complete SU2 case, each with an `Allrun` script.
 
 ## Solvers
 
@@ -315,7 +357,7 @@ for screening sweeps until the crossover is measured on real fairings.
 
 | Preset | Iterations | Mesh | Speed curve | For |
 |---|---|---|---|---|
-| Screening | 150 | 26 | one solve, scaled | ranking candidates against each other |
+| Screening | 150 | 26 | one solve, scaled | ranking designs against each other |
 | Balanced | 400 | 40 | automatic | ordinary work |
 | Accurate | 1000 | 60 | automatic | the design you are keeping |
 
@@ -385,10 +427,11 @@ directly. The containers do not have this problem: they set `PATH` through
 
 | File | Role |
 |---|---|
-| `src/server.py` | FastAPI backend for the GUI |
+| `src/server.py` | FastAPI backend for the GUI: the open runs and their jobs |
+| `src/runs.py` | The run record — shape, parameters, results — and the as-run diff |
 | `src/web/` | Browser front end (three.js vendored locally, no CDN) |
 | `src/scene.py` | Scene file format: payload, hull, flow, solver settings, results |
-| `src/fairing.py` | Closing sweep, topology plateaus, candidate fairing generation |
+| `src/fairing.py` | Closing sweep, single-body threshold, shell generation |
 | `src/estimates.py` | Runtime prediction, self-calibrating from measured solves |
 | `src/metrics.py` | Frontal area, flow domain, Reynolds analysis |
 | `src/solvers.py` | Backend registry and the scale-vs-sweep orchestration |

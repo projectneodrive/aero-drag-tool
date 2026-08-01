@@ -1,16 +1,19 @@
 """Automatic fairing generation from an arbitrary payload STL.
 
-The question "should this payload be one fairing or several?" is not a discrete
-choice to make up front -- it is a *length scale*. Two lumps belong to the same
-body when the gap between them is small compared to the skin you would wrap
-around them, and belong to separate bodies otherwise.
+The fairing is **always a single closed shell**. Separate pods around separate
+lumps are not offered: the gap between two pods is a channel with a boundary
+layer off both walls, which is usually worse than the solid bridge it was
+avoiding and needs cells finer than the gap to mesh at all. So the only
+question left is *how much closing it takes* to reach one body -- a length
+scale, not a choice.
 
-So instead of deciding, we sweep the scale. A morphological closing (dilate by
-r, then erode by r) hugs each lump at small r and bridges the gaps at large r,
-and the topology changes on its own. Plotting the number of connected
-components against r gives a staircase; the **plateaus are the candidate
-designs**, and a wide plateau means a topology that is robust rather than an
-accident of two things nearly touching.
+A morphological closing (dilate by r, then erode by r) hugs each lump at small
+r and bridges the gaps at large r, and the topology changes on its own. The
+number of connected components is monotone non-increasing in r, so there is a
+single threshold radius where the payload first becomes one body. This module
+locates that threshold by bisection and builds the shell just above it: enough
+closing to merge, and no more, because every millimetre past the threshold is
+frontal area bought for nothing.
 
 Two refinements matter:
 
@@ -23,7 +26,7 @@ Two refinements matter:
   skin and makes the clearance gap exact by construction, so the payload is
   guaranteed to fit with room to spare.
 
-The closing decides *topology*, not *profile*. It is bounded above by the
+The closing decides *whether it is one body*, not the *profile*. It is bounded above by the
 convex hull, so on a convex payload it is a no-op and the skin would come out
 as the payload plus clearance -- a rounded cube for a cube, which is a terrible
 thing to fly. The profile comes from a second stage, ``streamline_mask``: the
@@ -57,12 +60,15 @@ MAX_VOXELS = 40_000_000
 # gap close at a third of the radius a spanwise gap of the same size needs.
 DEFAULT_ANISOTROPY = 3.0
 
-# Configurations with more separate bodies than this are not worth proposing.
-MAX_SENSIBLE_BODIES = 8
+# Safety margin on the merge threshold. The sweep runs on a coarse grid and the
+# skin is built on a fine one, which resolves narrow gaps the sweep blurred
+# shut, so building exactly at the threshold can come out as two bodies.
+MERGE_MARGIN = 1.06
 
-# Gap between two bodies, as a fraction of the body scale, below which the
-# channel between them chokes and the configuration should be merged instead.
-CHOKED_GAP_RATIO = 0.06
+# How much to open the radius each time a built shell still splits, and how
+# many times to try before giving up.
+MERGE_ESCALATION = 1.45
+MERGE_ATTEMPTS = 4
 
 # Taper limits for the streamlined envelope, in degrees from the flow axis.
 # The tail is the one that matters: much past ~15 deg the boundary layer on the
@@ -416,97 +422,63 @@ def streamline_mask(
 
 
 @dataclass
-class Plateau:
-    """A range of closing radii over which the topology does not change."""
-
-    components: int
-    radius_min: float
-    radius_max: float
-    radius: float  # representative value, the middle of the plateau
-    width: float
-
-    def to_dict(self) -> dict:
-        return {
-            "components": self.components,
-            "radius_min": self.radius_min,
-            "radius_max": self.radius_max,
-            "radius": self.radius,
-            "width": self.width,
-        }
-
-
-@dataclass
 class SweepResult:
+    """Component count against closing radius, and where it reaches one body.
+
+    ``merge_radius`` is the smallest sampled radius at which the skin is a
+    single connected body -- the number the shell is built from. It is None
+    when even the largest radius the grid can hold leaves the payload in
+    pieces, which is a padding problem rather than a shape one.
+    """
+
     radii: list[float]
     components: list[int]
-    plateaus: list[Plateau]
+    merge_radius: float | None
     pitch: float
     anisotropy: float
     payload_extents: list[float]
+    limit: float = 0.0
+
+    @property
+    def bodies_at_zero(self) -> int:
+        return self.components[0] if self.components else 1
 
     def to_dict(self) -> dict:
         return {
             "radii": self.radii,
             "components": self.components,
-            "plateaus": [item.to_dict() for item in self.plateaus],
+            "merge_radius": self.merge_radius,
+            "bodies_at_zero": self.bodies_at_zero,
             "pitch": self.pitch,
             "anisotropy": self.anisotropy,
             "payload_extents": self.payload_extents,
+            "limit": self.limit,
         }
-
-
-def auto_radius_limit(grid: PayloadGrid, distance_outside: np.ndarray) -> float:
-    """The radius at which the last gap inside the payload closes.
-
-    This is the radius of the largest empty ball that fits inside the payload's
-    own bounding box. Sweeping past it tells you nothing -- everything has
-    already merged -- and sweeping a fixed fraction of the overall size instead
-    puts every interesting transition below the first sample, which is how the
-    first version of this missed the topology entirely.
-    """
-    filled = np.argwhere(grid.occupancy)
-    lower = filled.min(axis=0)
-    upper = filled.max(axis=0) + 1
-    interior = distance_outside[lower[0]:upper[0], lower[1]:upper[1], lower[2]:upper[2]]
-    largest_gap = float(interior.max()) if interior.size else 0.0
-    return max(largest_gap * 1.15, grid.pitch * 8)
-
-
-def safe_radii(grid: PayloadGrid, radii, anisotropy: float, clearance: float = 0.0) -> tuple[list[float], str | None]:
-    """Drop radii the grid padding cannot support, and say so if any went."""
-    limit = grid.max_safe_radius(anisotropy, clearance)
-    kept = [float(value) for value in radii if value <= limit]
-    if not kept:
-        kept = [0.0]
-    if len(kept) == len(list(radii)):
-        return kept, None
-    return kept, (
-        f"Closing radii above {limit:.3g} m were dropped: the padded grid cannot hold a "
-        f"dilation that large, and a clipped one would produce a fairing that does not "
-        "enclose the payload."
-    )
 
 
 def sweep(
     grid: PayloadGrid,
-    radii: list[float] | None = None,
     anisotropy: float = DEFAULT_ANISOTROPY,
-    max_samples: int = 18,
+    max_samples: int = 16,
     progress=None,
     clearance: float = 0.0,
 ) -> SweepResult:
-    """Locate the topology transitions across closing radius.
+    """Find the smallest closing radius that makes the payload one body.
 
-    Component count is monotone non-increasing in r, so a uniform sweep wastes
-    most of its samples confirming what is already merged. Instead: grow the
-    upper bound until everything is one body, then bisect between neighbouring
-    samples that disagree. Same budget, transitions located far more precisely,
-    which is what sets the plateau edges.
+    Component count is monotone non-increasing in r, which is what makes this
+    a bisection rather than a search: there is exactly one threshold, and
+    every radius above it also merges. So grow an upper bound until the count
+    reaches one, then halve the bracket until it is tighter than a voxel.
+
+    Sampling uniformly instead would spend most of its budget confirming what
+    is already merged, and would locate the threshold no better than the
+    sample spacing -- which then goes straight into the frontal area, since
+    the shell is built just above it.
     """
     extents = np.asarray(grid.occupancy.shape, dtype=float) * grid.pitch
     distance_outside = _ensure_distance(grid, anisotropy)
-    limit = grid.max_safe_radius(anisotropy)
-    tolerance = max(grid.pitch, limit / 128.0)
+    limit = grid.max_safe_radius(anisotropy, clearance)
+    tolerance = max(grid.pitch, limit / 256.0)
 
     samples: dict[float, int] = {}
 
@@ -515,7 +487,9 @@ def sweep(
         existing = next((key for key in samples if abs(key - radius) < 1e-12), None)
         if existing is not None:
             return samples[existing]
-        mask = closed_mask(grid, radius, anisotropy, distance_outside=distance_outside, clearance=clearance)
+        mask = closed_mask(
+            grid, radius, anisotropy, distance_outside=distance_outside, clearance=clearance
+        )
         _, count = ndimage.label(mask)
         samples[radius] = int(count)
         if progress is not None:
@@ -530,106 +504,57 @@ def sweep(
             )
         return int(count)
 
-    if radii is not None:
-        for radius in radii:
-            count_at(radius)
+    merge_radius: float | None = None
+
+    if count_at(0.0) == 1:
+        # Already one lump: the shell is the clearance offset and nothing more.
+        merge_radius = 0.0
     else:
-        count_at(0.0)
-        # Grow until everything has merged, so the sweep spans exactly the
-        # interesting range rather than a guessed fraction of the payload size.
+        low = 0.0
+        high = None
         upper = max(limit / 16.0, grid.pitch * 2)
-        while count_at(upper) > 1 and upper < limit and len(samples) < max_samples // 2:
+        while len(samples) < max_samples:
+            if count_at(upper) == 1:
+                high = upper
+                break
+            low = upper
+            if upper >= limit:
+                break
             upper = min(upper * 2.0, limit)
 
-        # Bisect the widest bracket that still straddles a transition.
-        while len(samples) < max_samples:
-            ordered = sorted(samples)
-            bracket = None
-            widest = 0.0
-            for low, high in zip(ordered, ordered[1:]):
-                if samples[low] != samples[high] and (high - low) > max(tolerance, widest):
-                    widest = high - low
-                    bracket = (low, high)
-            if bracket is None:
-                break
-            count_at(0.5 * (bracket[0] + bracket[1]))
+        if high is not None:
+            # Tighten the bracket. Every iteration keeps `low` at more than one
+            # body and `high` at exactly one, so `high` is always a radius that
+            # is known to work.
+            while high - low > tolerance and len(samples) < max_samples:
+                middle = 0.5 * (low + high)
+                if count_at(middle) == 1:
+                    high = middle
+                else:
+                    low = middle
+            merge_radius = high
 
     ordered = sorted(samples)
     counts = [samples[key] for key in ordered]
 
-    clipped_note = None
-    if counts and counts[-1] > 1:
-        clipped_note = (
+    if merge_radius is None:
+        note = (
             f"Even at the largest radius the grid can hold ({limit:.3g} m) the payload still "
-            f"splits into {counts[-1]} bodies. A single-body fairing would need more padding."
+            f"splits into {counts[-1]} bodies, so no single-body shell could be built. "
+            "Raise the streamwise bias or the clearance, which both bridge gaps sooner."
         )
-        if clipped_note not in grid.warnings:
-            grid.warnings.append(clipped_note)
+        if note not in grid.warnings:
+            grid.warnings.append(note)
 
     return SweepResult(
         radii=[float(value) for value in ordered],
         components=counts,
-        plateaus=find_plateaus(ordered, counts),
+        merge_radius=merge_radius,
         pitch=grid.pitch,
         anisotropy=anisotropy,
         payload_extents=extents.tolist(),
+        limit=float(limit),
     )
-
-
-def find_plateaus(
-    radii,
-    counts,
-    max_bodies: int = MAX_SENSIBLE_BODIES,
-    open_top: bool = True,
-) -> list[Plateau]:
-    """Runs of constant component count, widest first.
-
-    Plateau width is a confidence measure: a topology that survives a wide
-    range of radii is a real design, while one that exists only in a narrow
-    band is an artefact of two lumps happening to be nearly touching.
-    """
-    radii = [float(value) for value in radii]
-    counts = [int(value) for value in counts]
-    if not radii:
-        return []
-
-    plateaus: list[Plateau] = []
-    start = 0
-    for index in range(1, len(counts) + 1):
-        if index < len(counts) and counts[index] == counts[start]:
-            continue
-
-        low = radii[start]
-        # The plateau really runs up to the next sampled radius, where the
-        # count changed; use that as the upper edge.
-        high = radii[index] if index < len(radii) else radii[-1]
-        if index >= len(radii) and open_top:
-            # The final topology persists for every larger radius, so its
-            # sampled upper edge is an artefact of where the sweep stopped.
-            # Cap it at twice the transition: past that the fairing is just an
-            # inflated blob, not a different design.
-            high = max(low * 2.0, high)
-        count = counts[start]
-        if 0 < count <= max_bodies:
-            plateaus.append(
-                Plateau(
-                    components=count,
-                    radius_min=low,
-                    radius_max=high,
-                    radius=0.5 * (low + high),
-                    width=high - low,
-                )
-            )
-        start = index
-
-    # Keep one entry per topology: the widest run wins if a count reappears.
-    best: dict[int, Plateau] = {}
-    for plateau in plateaus:
-        current = best.get(plateau.components)
-        if current is None or plateau.width > current.width:
-            best[plateau.components] = plateau
-
-    return sorted(best.values(), key=lambda item: (-item.width, item.components))
 
 
 def build_fairing(
@@ -639,6 +564,7 @@ def build_fairing(
     anisotropy: float = DEFAULT_ANISOTROPY,
     smoothing_iterations: int = 12,
     streamline: tuple[float, float] | None = None,
+    field_sigma_voxels: float = 1.2,
 ) -> trimesh.Trimesh:
     """Build the fairing skin for one closing radius.
 
@@ -649,6 +575,16 @@ def build_fairing(
     With ``streamline`` set to a (nose, tail) angle pair, the closed set is
     replaced by its taper-bounded envelope first: same topology decision, but
     a profile shaped to fly rather than merely to enclose.
+
+    ``field_sigma_voxels`` smooths the distance *field*, not the mesh. The
+    field is computed from a binary mask, so its level sets carry staircase
+    ripples at the voxel pitch -- which is exactly the wavelength Taubin on
+    the extracted mesh is too local to remove. A Gaussian on the field kills
+    them at the source: it preserves linear fields exactly, so wherever the
+    surface is flat or gently curved the level set does not move at all, and
+    only features at the noise scale are touched. The sigma is capped well
+    below the extraction level so tight corners are rounded by millimetres,
+    never eaten; the containment check downstream still verifies the result.
     """
     mask = closed_mask(grid, radius, anisotropy, distance_outside=_ensure_distance(grid, anisotropy))
     if streamline is not None:
@@ -665,9 +601,20 @@ def build_fairing(
     # merges, not a distortion we want baked into the skin.
     outside = ndimage.distance_transform_edt(~mask, sampling=grid.pitch)
     inside = ndimage.distance_transform_edt(mask, sampling=grid.pitch)
-    field = outside - inside
+    field = (outside - inside).astype(np.float32)
+    del outside, inside  # each is as large as the grid; drop them before filtering
 
     level = max(float(clearance), grid.pitch * 0.5)
+
+    if field_sigma_voxels > 0:
+        # Cap the filter width against the extraction level: the level set of
+        # a smoothed field shifts by about sigma^2 * curvature / 2, and the
+        # tightest curvature on an offset surface is 1/level (the rounded
+        # payload edges). At 0.6 * level the worst-case shift is under a fifth
+        # of the clearance; at the default sigma and pitch it is millimetres.
+        sigma = min(field_sigma_voxels * grid.pitch, 0.6 * level) / grid.pitch
+        field = ndimage.gaussian_filter(field, sigma=sigma)
+
     if float(field.max()) <= level:
         raise ValueError("Clearance exceeds the padding around the payload")
 
@@ -692,52 +639,42 @@ def build_fairing(
 
 
 @dataclass
-class Candidate:
-    """One proposed fairing, ready to be costed by the solvers."""
+class Shell:
+    """The single-body fairing built around a payload."""
 
     radius: float
-    components: int
-    plateau_width: float
+    merge_radius: float | None
     clearance: float
+    anisotropy: float
     frontal_area: float
     wetted_area: float
     volume: float | None
     watertight: bool
     contains_payload: bool | None
     triangle_count: int
-    min_gap: float | None = None
-    gap_ratio: float | None = None
+    # How many radii had to be tried before the built skin came out as one
+    # body. More than one means the fine grid disagreed with the sweep grid.
+    attempts: int = 1
+    bodies: int = 1
     streamlined: bool = False
     nose_angle_deg: float | None = None
     tail_angle_deg: float | None = None
     mesh: trimesh.Trimesh = field(repr=False, default=None)
 
-    @property
-    def choked(self) -> bool:
-        """Are two bodies close enough that the flow between them chokes?
-
-        A narrow gap is high velocity with a boundary layer off both walls,
-        often worse than the solid bridge you were avoiding -- and it needs
-        cells finer than the gap, which makes the case expensive to mesh as
-        well as bad to fly.
-        """
-        return self.gap_ratio is not None and self.gap_ratio < CHOKED_GAP_RATIO
-
     def to_dict(self) -> dict:
         return {
             "radius": self.radius,
-            "components": self.components,
-            "plateau_width": self.plateau_width,
+            "merge_radius": self.merge_radius,
             "clearance": self.clearance,
+            "anisotropy": self.anisotropy,
             "frontal_area": self.frontal_area,
             "wetted_area": self.wetted_area,
             "volume": self.volume,
             "watertight": self.watertight,
             "contains_payload": self.contains_payload,
             "triangle_count": self.triangle_count,
-            "min_gap": self.min_gap,
-            "gap_ratio": self.gap_ratio,
-            "choked": self.choked,
+            "attempts": self.attempts,
+            "bodies": self.bodies,
             "streamlined": self.streamlined,
             "nose_angle_deg": self.nose_angle_deg,
             "tail_angle_deg": self.tail_angle_deg,
@@ -748,8 +685,9 @@ def smallest_gap(bodies: list[trimesh.Trimesh]) -> float | None:
     """Closest approach between any two separate bodies, or None if only one.
 
     Vertex-to-vertex via a KD-tree: an over-estimate of the true surface gap
-    by at most the triangle size, which is plenty for deciding whether a
-    channel is dangerously narrow.
+    by at most the triangle size. The generated shell is always one body, so
+    this is for meshing an imported STL that is not -- SU2 sizes its cells off
+    the narrowest channel it has to resolve.
     """
     if len(bodies) < 2:
         return None
@@ -789,88 +727,95 @@ def check_containment(fairing: trimesh.Trimesh, payload: trimesh.Trimesh, sample
         return None
 
 
-def candidates_from_sweep(
+def build_single_shell(
     grid: PayloadGrid,
     payload: trimesh.Trimesh,
     result: SweepResult,
     direction=(1.0, 0.0, 0.0),
     clearance: float = 0.02,
     smoothing_iterations: int = 12,
-    limit: int = 4,
     progress=None,
     build_grid_override: PayloadGrid | None = None,
     streamline: tuple[float, float] | None = None,
-) -> list[Candidate]:
-    """Turn the widest plateaus into buildable fairings with their metrics.
+) -> Shell:
+    """Build the one-body shell at the smallest radius that merges the payload.
 
-    The sweep runs on a coarse grid because counting components tolerates a
-    blurry payload; the skins are built on a finer one, since that geometry is
+    The sweep runs on a coarse grid, because counting components tolerates a
+    blurry payload; the skin is built on a finer one, since that geometry is
     what the solvers actually mesh. Radii are physical lengths, so they carry
-    across unchanged.
+    across unchanged -- but the fine grid *resolves narrow gaps the coarse one
+    blurred shut*, so the threshold it found can come out as two bodies once
+    built. That is why this verifies the result and opens the radius until the
+    skin really is one body, rather than trusting the sweep's number.
 
-    With ``streamline`` set, every skin is the taper-bounded envelope rather
-    than the raw closing. The plateau still decides what merges *spanwise*;
-    the envelope handles the streamwise profile, and may fair in-line bodies
-    into each other, so the component count is recounted from the mesh.
+    Failing to check is the whole failure mode this function exists to
+    prevent: a two-piece "single shell" meshes into a choked channel and
+    reports a drag coefficient for a shape nobody chose.
     """
     grid = build_grid_override or grid
     angles = _clamped_angles(*streamline) if streamline is not None else None
-    candidates: list[Candidate] = []
-    for index, plateau in enumerate(result.plateaus[:limit]):
+    limit = grid.max_safe_radius(result.anisotropy, clearance)
+
+    if result.merge_radius is None:
+        raise ValueError(
+            "The payload never closes into a single body within the grid the padding can "
+            "hold. Raise the streamwise bias or the clearance."
+        )
+
+    radius = min(result.merge_radius * MERGE_MARGIN, limit)
+    mesh = None
+    bodies = 0
+    attempt = 0
+
+    for attempt in range(1, MERGE_ATTEMPTS + 1):
         if progress is not None:
             progress(
                 {
-                    "phase": "candidate",
-                    "index": index,
-                    "total": min(len(result.plateaus), limit),
-                    "message": f"Building the {plateau.components}-body fairing "
-                    f"(r = {plateau.radius:.4g} m)",
+                    "phase": "shell",
+                    "index": attempt - 1,
+                    "total": MERGE_ATTEMPTS,
+                    "message": f"Building the shell at r = {radius * 1000:.0f} mm"
+                    + (f" (attempt {attempt})" if attempt > 1 else ""),
                 }
             )
-        try:
-            mesh = build_fairing(
-                grid,
-                plateau.radius,
-                clearance=clearance,
-                anisotropy=result.anisotropy,
-                smoothing_iterations=smoothing_iterations,
-                streamline=angles,
-            )
-        except Exception:
-            continue
-
-        bodies = mesh.split(only_watertight=False)
-        if angles is not None and len(bodies) < plateau.components and progress is not None:
+        mesh = build_fairing(
+            grid,
+            radius,
+            clearance=clearance,
+            anisotropy=result.anisotropy,
+            smoothing_iterations=smoothing_iterations,
+            streamline=angles,
+        )
+        bodies = max(len(mesh.split(only_watertight=False)), 1)
+        if bodies == 1:
+            break
+        if radius >= limit:
+            break
+        radius = min(radius * MERGE_ESCALATION, limit)
+        if progress is not None:
             progress(
                 {
-                    "phase": "candidate",
-                    "index": index,
-                    "total": min(len(result.plateaus), limit),
-                    "message": f"Tail fairing merged the {plateau.components} bodies "
-                    f"into {len(bodies)}",
+                    "phase": "shell",
+                    "message": f"The skin came out as {bodies} bodies at that radius; "
+                    f"opening it to {radius * 1000:.0f} mm",
                 }
             )
-        min_gap = smallest_gap(bodies)
-        body_scale = float(np.max(np.asarray(mesh.extents, dtype=float)))
-        candidates.append(
-            Candidate(
-                min_gap=min_gap,
-                gap_ratio=None if min_gap is None or body_scale <= 0 else min_gap / body_scale,
-                radius=plateau.radius,
-                components=max(len(bodies), 1),
-                plateau_width=plateau.width,
-                clearance=clearance,
-                frontal_area=frontal_area(mesh, direction),
-                wetted_area=float(mesh.area),
-                volume=float(mesh.volume) if mesh.is_watertight else None,
-                watertight=bool(mesh.is_watertight),
-                contains_payload=check_containment(mesh, payload),
-                triangle_count=int(len(mesh.faces)),
-                streamlined=angles is not None,
-                nose_angle_deg=None if angles is None else angles[0],
-                tail_angle_deg=None if angles is None else angles[1],
-                mesh=mesh,
-            )
-        )
 
-    return candidates
+    return Shell(
+        radius=float(radius),
+        merge_radius=result.merge_radius,
+        clearance=clearance,
+        anisotropy=result.anisotropy,
+        frontal_area=frontal_area(mesh, direction),
+        wetted_area=float(mesh.area),
+        volume=float(mesh.volume) if mesh.is_watertight else None,
+        watertight=bool(mesh.is_watertight),
+        contains_payload=check_containment(mesh, payload),
+        triangle_count=int(len(mesh.faces)),
+        attempts=attempt,
+        bodies=bodies,
+        streamlined=angles is not None,
+        nose_angle_deg=None if angles is None else angles[0],
+        tail_angle_deg=None if angles is None else angles[1],
+        mesh=mesh,
+    )
