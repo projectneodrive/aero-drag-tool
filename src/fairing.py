@@ -22,6 +22,19 @@ Two refinements matter:
   positive level, not from the raw voxel mask. That gives a smooth, sub-voxel
   skin and makes the clearance gap exact by construction, so the payload is
   guaranteed to fit with room to spare.
+
+The closing decides *topology*, not *profile*. It is bounded above by the
+convex hull, so on a convex payload it is a no-op and the skin would come out
+as the payload plus clearance -- a rounded cube for a cube, which is a terrible
+thing to fly. The profile comes from a second stage, ``streamline_mask``: the
+minimal envelope whose cross-sections grow no steeper than a nose angle and
+shrink no steeper than a tail angle along the flow. That is not a shape search;
+it encodes the two rules that dominate bluff-body drag -- keep the tail shallow
+enough to stay attached, and never carry more section than the payload forces
+-- and computes the smallest body satisfying them. A cube in, a teardrop out,
+with the tail length set by the taper limit rather than by taste. Whether a
+given taper limit was worth its wetted area is then the solvers' question, not
+this module's.
 """
 
 from __future__ import annotations
@@ -50,6 +63,19 @@ MAX_SENSIBLE_BODIES = 8
 # Gap between two bodies, as a fraction of the body scale, below which the
 # channel between them chokes and the configuration should be merged instead.
 CHOKED_GAP_RATIO = 0.06
+
+# Taper limits for the streamlined envelope, in degrees from the flow axis.
+# The tail is the one that matters: much past ~15 deg the boundary layer on the
+# afterbody separates and the wake swallows whatever the shorter tail saved.
+# The nose is far more forgiving -- the flow there is accelerating -- so it can
+# be blunt without much penalty, and 45 deg keeps the nose usefully short.
+DEFAULT_NOSE_ANGLE_DEG = 45.0
+DEFAULT_TAIL_ANGLE_DEG = 12.0
+
+# Outside these the envelope stops meaning anything: a tail shallower than
+# 5 deg is many body-lengths of skin friction for nothing, and angles near
+# 90 deg divide by ~zero in the padding maths.
+_ANGLE_BOUNDS = {"nose": (10.0, 80.0), "tail": (5.0, 45.0)}
 
 
 @dataclass
@@ -131,12 +157,20 @@ def build_grid(
     margin: float = 0.4,
     pitch: float | None = None,
     anisotropy: float = DEFAULT_ANISOTROPY,
+    streamline: tuple[float, float] | None = None,
+    clearance: float = 0.0,
 ) -> PayloadGrid:
     """Voxelise ``mesh`` in the flow-aligned frame, with room to dilate into.
 
     ``margin`` is the padding around the payload as a fraction of its longest
     extent; it has to exceed the largest closing radius plus clearance or the
     dilation runs off the edge of the grid and the fairing comes out clipped.
+
+    ``streamline`` is the (nose, tail) angle pair the envelope will be built
+    with, if any. It matters here because the tail cone is *long* -- half the
+    cross-flow width over tan(12 deg) is 2.4 body-widths -- and a grid padded
+    symmetrically would clip it off. The padding this adds is asymmetric:
+    exactly the streamwise room the cones can reach, and nothing spanwise.
     """
     rotation = flow_frame(direction)
     local = mesh.copy()
@@ -166,15 +200,21 @@ def build_grid(
     # radii that matter are far below the limit in practice.
     base_pad = max(longest * margin, pitch * 4)
     pad = np.array([base_pad, base_pad, base_pad])
-    origin = bounds[0] - pad
-    dims = np.ceil((extents + 2 * pad) / pitch).astype(int) + 1
+    pad_lower = pad.copy()
+    pad_upper = pad.copy()
+    if streamline is not None:
+        nose_room, tail_room = streamline_rooms(extents, streamline, clearance, pitch)
+        pad_lower[0] += nose_room
+        pad_upper[0] += tail_room
+    origin = bounds[0] - pad_lower
+    dims = np.ceil((extents + pad_lower + pad_upper) / pitch).astype(int) + 1
 
     if int(np.prod(dims)) > MAX_VOXELS:
         # Coarsen rather than fail: a clipped grid would silently produce a
         # truncated fairing, which is far worse than a blurrier one.
         scale = (int(np.prod(dims)) / MAX_VOXELS) ** (1.0 / 3.0)
         pitch *= scale
-        dims = np.ceil((extents + 2 * pad) / pitch).astype(int) + 1
+        dims = np.ceil((extents + pad_lower + pad_upper) / pitch).astype(int) + 1
         warnings.append(
             f"Voxel pitch was coarsened to {pitch * 1000:.1f} mm to stay within the memory "
             "budget; parts thinner than that may merge or disappear in the topology count."
@@ -293,6 +333,86 @@ def _grow(grid: PayloadGrid, mask: np.ndarray, clearance: float) -> np.ndarray:
     """
     distance = ndimage.distance_transform_edt(~mask, sampling=grid.pitch)
     return distance <= clearance
+
+
+def _clamped_angles(nose_angle_deg: float, tail_angle_deg: float) -> tuple[float, float]:
+    nose_low, nose_high = _ANGLE_BOUNDS["nose"]
+    tail_low, tail_high = _ANGLE_BOUNDS["tail"]
+    return (
+        float(np.clip(nose_angle_deg, nose_low, nose_high)),
+        float(np.clip(tail_angle_deg, tail_low, tail_high)),
+    )
+
+
+def streamline_rooms(
+    extents, angles: tuple[float, float], clearance: float, pitch: float
+) -> tuple[float, float]:
+    """Streamwise padding the nose and tail cones need, in metres.
+
+    A cone dies where the accumulated taper has eaten the section's inradius,
+    and the inradius is bounded by half the smaller cross-flow extent plus the
+    clearance the level set later adds outward. Anything short of this room
+    would clip the tail tip -- silently, which is the one failure mode this
+    module keeps having to design out.
+    """
+    nose_deg, tail_deg = _clamped_angles(*angles)
+    half_cross = 0.5 * float(min(extents[1], extents[2])) + clearance
+    nose_room = half_cross / float(np.tan(np.radians(nose_deg))) + clearance + 6 * pitch
+    tail_room = half_cross / float(np.tan(np.radians(tail_deg))) + clearance + 6 * pitch
+    return float(nose_room), float(tail_room)
+
+
+def streamline_mask(
+    mask: np.ndarray,
+    pitch: float,
+    nose_angle_deg: float = DEFAULT_NOSE_ANGLE_DEG,
+    tail_angle_deg: float = DEFAULT_TAIL_ANGLE_DEG,
+) -> np.ndarray:
+    """The minimal taper-bounded envelope of ``mask``, axis 0 along the flow.
+
+    The envelope is the union, over every cross-section of the payload, of
+    that section swept downstream while eroding at tan(tail) per metre and
+    upstream while eroding at tan(nose): each section casts a shallow cone
+    aft and a steep one forward, and the body is the upper envelope of all of
+    them. It is the smallest set that contains the payload, never grows
+    steeper than the nose angle, and never shrinks steeper than the tail
+    angle -- which is exactly the "minimum drag body that still fits" under
+    the attached-flow heuristic, before the solvers get their say.
+
+    Computed exactly, not by repeated binary erosion (whose per-slice step of
+    tan(12 deg) * pitch is a fifth of a voxel and would round to nothing):
+    per-slice Euclidean distance fields are carried along the axis with the
+    taper subtracted per step and merged with a running max. Level sets of a
+    max are unions of level sets, and level sets of (EDT - c) are exact
+    erosions, so the positive set of the carry *is* the union of cones with
+    no accumulated discretisation error.
+
+    Two lumps in line fair into each other automatically -- the leading
+    body's tail cone reaches the trailing body's nose -- so this can merge
+    components the closing kept separate. That is the aerodynamically right
+    call, but callers should recount bodies afterwards rather than trust the
+    plateau's number.
+    """
+    nose_deg, tail_deg = _clamped_angles(nose_angle_deg, tail_angle_deg)
+    envelope = np.zeros_like(mask)
+    passes = (
+        # Tail cones: swept downstream, shallow.
+        (float(np.tan(np.radians(tail_deg))) * pitch, range(mask.shape[0])),
+        # Nose cones: swept upstream, steep.
+        (float(np.tan(np.radians(nose_deg))) * pitch, range(mask.shape[0] - 1, -1, -1)),
+    )
+    for step, order in passes:
+        carry = np.full(mask.shape[1:], -np.inf)
+        for index in order:
+            carry -= step
+            if mask[index].any():
+                np.maximum(
+                    carry,
+                    ndimage.distance_transform_edt(mask[index], sampling=pitch),
+                    out=carry,
+                )
+            envelope[index] |= carry > 0.0
+    return envelope
 
 
 @dataclass
@@ -518,14 +638,28 @@ def build_fairing(
     clearance: float = 0.02,
     anisotropy: float = DEFAULT_ANISOTROPY,
     smoothing_iterations: int = 12,
+    streamline: tuple[float, float] | None = None,
 ) -> trimesh.Trimesh:
     """Build the fairing skin for one closing radius.
 
     The surface is the ``clearance`` level set of the signed distance field of
     the closed payload, so the gap between payload and skin is exact and the
     skin is smooth to sub-voxel precision rather than following voxel corners.
+
+    With ``streamline`` set to a (nose, tail) angle pair, the closed set is
+    replaced by its taper-bounded envelope first: same topology decision, but
+    a profile shaped to fly rather than merely to enclose.
     """
     mask = closed_mask(grid, radius, anisotropy, distance_outside=_ensure_distance(grid, anisotropy))
+    if streamline is not None:
+        mask = streamline_mask(mask, grid.pitch, *streamline)
+        # The rooms added in build_grid keep the cones clear of the border;
+        # clearing it anyway means a mis-sized grid yields a closed (if
+        # clipped) surface instead of an open mesh that fails everywhere
+        # downstream.
+        mask[0, :, :] = mask[-1, :, :] = False
+        mask[:, 0, :] = mask[:, -1, :] = False
+        mask[:, :, 0] = mask[:, :, -1] = False
 
     # Isotropic distance here: the anisotropy was a decision rule for what
     # merges, not a distortion we want baked into the skin.
@@ -573,6 +707,9 @@ class Candidate:
     triangle_count: int
     min_gap: float | None = None
     gap_ratio: float | None = None
+    streamlined: bool = False
+    nose_angle_deg: float | None = None
+    tail_angle_deg: float | None = None
     mesh: trimesh.Trimesh = field(repr=False, default=None)
 
     @property
@@ -601,6 +738,9 @@ class Candidate:
             "min_gap": self.min_gap,
             "gap_ratio": self.gap_ratio,
             "choked": self.choked,
+            "streamlined": self.streamlined,
+            "nose_angle_deg": self.nose_angle_deg,
+            "tail_angle_deg": self.tail_angle_deg,
         }
 
 
@@ -659,6 +799,7 @@ def candidates_from_sweep(
     limit: int = 4,
     progress=None,
     build_grid_override: PayloadGrid | None = None,
+    streamline: tuple[float, float] | None = None,
 ) -> list[Candidate]:
     """Turn the widest plateaus into buildable fairings with their metrics.
 
@@ -666,8 +807,14 @@ def candidates_from_sweep(
     blurry payload; the skins are built on a finer one, since that geometry is
     what the solvers actually mesh. Radii are physical lengths, so they carry
     across unchanged.
+
+    With ``streamline`` set, every skin is the taper-bounded envelope rather
+    than the raw closing. The plateau still decides what merges *spanwise*;
+    the envelope handles the streamwise profile, and may fair in-line bodies
+    into each other, so the component count is recounted from the mesh.
     """
     grid = build_grid_override or grid
+    angles = _clamped_angles(*streamline) if streamline is not None else None
     candidates: list[Candidate] = []
     for index, plateau in enumerate(result.plateaus[:limit]):
         if progress is not None:
@@ -687,11 +834,22 @@ def candidates_from_sweep(
                 clearance=clearance,
                 anisotropy=result.anisotropy,
                 smoothing_iterations=smoothing_iterations,
+                streamline=angles,
             )
         except Exception:
             continue
 
         bodies = mesh.split(only_watertight=False)
+        if angles is not None and len(bodies) < plateau.components and progress is not None:
+            progress(
+                {
+                    "phase": "candidate",
+                    "index": index,
+                    "total": min(len(result.plateaus), limit),
+                    "message": f"Tail fairing merged the {plateau.components} bodies "
+                    f"into {len(bodies)}",
+                }
+            )
         min_gap = smallest_gap(bodies)
         body_scale = float(np.max(np.asarray(mesh.extents, dtype=float)))
         candidates.append(
@@ -708,6 +866,9 @@ def candidates_from_sweep(
                 watertight=bool(mesh.is_watertight),
                 contains_payload=check_containment(mesh, payload),
                 triangle_count=int(len(mesh.faces)),
+                streamlined=angles is not None,
+                nose_angle_deg=None if angles is None else angles[0],
+                tail_angle_deg=None if angles is None else angles[1],
                 mesh=mesh,
             )
         )

@@ -1,8 +1,13 @@
-"""OpenFOAM 13 drag backend, driven through WSL.
+"""OpenFOAM 13 drag backend.
 
 Generates a complete case from a triangle mesh (blockMesh background grid,
 snappyHexMesh body fit, incompressibleFluid steady solve with a forceCoeffs
 function object) and reads the drag coefficient back out.
+
+The solver runs wherever :mod:`execution` finds it -- a pinned Docker image,
+a WSL install, or natively on PATH. The container is the reproducible option
+and is what the Dockerfile in ``docker/`` builds; WSL remains supported
+because it is what an existing install looks like.
 
 Notes on OpenFOAM 13 specifics:
 
@@ -29,11 +34,16 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+import execution as execution_env
+from execution import Runner
 from metrics import flow_domain, frontal_area
 
 
 WSL_DISTRO = "Ubuntu-22.04"
 OPENFOAM_BASHRC = "/opt/openfoam13/etc/bashrc"
+# The container installs OpenFOAM to the same prefix, so one preamble serves
+# both and the case dictionaries are identical either way.
+OPENFOAM_PREAMBLE = f"source {shlex.quote(OPENFOAM_BASHRC)}"
 
 # Standard k-omega closure constant, used to seed omega from k.
 C_MU = 0.09
@@ -51,17 +61,68 @@ def _normalize(vector: np.ndarray) -> np.ndarray:
     return vector / norm
 
 
-def openfoam_available() -> bool:
+def _native_runner(processes: int) -> Runner | None:
+    if shutil.which("foamRun") is None:
+        return None
+    return Runner(mode="native", processes=processes, label="foamRun", preamble="")
+
+
+def _docker_runner(processes: int) -> Runner | None:
+    image = execution_env.OPENFOAM_IMAGE
+    if not execution_env.docker_available() or not execution_env.image_present(image):
+        return None
+    return Runner(
+        mode="docker",
+        processes=processes,
+        image=image,
+        preamble=OPENFOAM_PREAMBLE,
+        label="foamRun",
+    )
+
+
+def _wsl_runner(processes: int) -> Runner | None:
     try:
-        result = subprocess.run(
+        probe = subprocess.run(
             ["wsl", "-d", WSL_DISTRO, "-u", "root", "-e", "bash", "-lc", f"test -f {shlex.quote(OPENFOAM_BASHRC)}"],
             capture_output=True,
             text=True,
             timeout=60,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+        return None
+    if probe.returncode != 0:
+        return None
+    return Runner(
+        mode="wsl",
+        processes=processes,
+        distro=WSL_DISTRO,
+        preamble=OPENFOAM_PREAMBLE,
+        as_root=True,
+        label="foamRun",
+    )
+
+
+_PROBES = {"native": _native_runner, "docker": _docker_runner, "wsl": _wsl_runner}
+
+
+def detect_openfoam(processes: int | None = None) -> Runner | None:
+    """Find a usable OpenFOAM 13. Returns None if there is none.
+
+    Order is native, Docker, WSL -- fastest first, then the reproducible one,
+    then the legacy install. ``AERO_EXECUTION`` pins a single mode instead.
+    """
+    count = execution_env.resolve_processes(processes)
+    forced = execution_env.forced_mode()
+    order = [forced] if forced else list(execution_env.MODES)
+    for mode in order:
+        runner = _PROBES[mode](count)
+        if runner is not None:
+            return runner
+    return None
+
+
+def openfoam_available() -> bool:
+    return detect_openfoam() is not None
 
 
 def windows_to_wsl_path(path: str | Path) -> str:
@@ -73,24 +134,6 @@ def windows_to_wsl_path(path: str | Path) -> str:
         text=True,
     )
     return completed.stdout.strip()
-
-
-def run_wsl_bash(
-    script: str,
-    cwd: str | Path | None = None,
-    capture_output: bool = False,
-    check: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    command = f"source {shlex.quote(OPENFOAM_BASHRC)}"
-    if cwd is not None:
-        command += f" && cd {shlex.quote(windows_to_wsl_path(cwd))}"
-    command += f" && {script}"
-    return subprocess.run(
-        ["wsl", "-d", WSL_DISTRO, "-u", "root", "-e", "bash", "-lc", command],
-        check=check,
-        capture_output=capture_output,
-        text=True,
-    )
 
 
 def orthonormal_basis(direction: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -918,8 +961,9 @@ def prepare_openfoam_case(
     }
 
 
-def _run_openfoam_commands(case_dir: Path, n_processors: int = 1) -> Path:
+def _run_openfoam_commands(case_dir: Path, runner: Runner) -> Path:
     """Mesh and solve. Meshing stays serial; only the solve is decomposed."""
+    n_processors = runner.processes
     if n_processors > 1:
         solve = (
             "decomposePar -force > log.decomposePar 2>&1 ; "
@@ -936,7 +980,7 @@ def _run_openfoam_commands(case_dir: Path, n_processors: int = 1) -> Path:
             solve,
         ]
     )
-    run_wsl_bash(commands, cwd=case_dir, capture_output=False, check=False)
+    runner.bash(commands, case_dir=case_dir, capture_output=False, check=False)
 
     log_path = case_dir / "log.foamRun"
     if not log_path.exists():
@@ -947,7 +991,9 @@ def _run_openfoam_commands(case_dir: Path, n_processors: int = 1) -> Path:
                     f"OpenFOAM stopped before the solve. Tail of {name}:\n"
                     + "\n".join(candidate.read_text(encoding="utf-8", errors="ignore").splitlines()[-25:])
                 )
-        raise RuntimeError("OpenFOAM produced no logs at all; is the WSL distro running?")
+        raise RuntimeError(
+            f"OpenFOAM produced no logs at all ({runner.describe()}); is that environment running?"
+        )
     return log_path
 
 
@@ -970,13 +1016,16 @@ def run_openfoam_drag(
     mesh_resolution: int = 40,
     refinement_level: int = 3,
     moving_ground: bool = False,
-    n_processors: int = 1,
+    n_processors: int | None = None,
     reference_area: float | None = None,
 ) -> OpenFOAMResult:
-    if not openfoam_available():
+    runner = detect_openfoam(n_processors)
+    if runner is None:
         raise RuntimeError(
-            f"OpenFOAM 13 is not reachable ({OPENFOAM_BASHRC} in WSL {WSL_DISTRO})"
+            "OpenFOAM 13 is not reachable. Build the container image "
+            f"(docker/build.sh), or install it at {OPENFOAM_BASHRC} in WSL {WSL_DISTRO}."
         )
+    n_processors = runner.processes
 
     wind_vector = np.asarray(wind_vector, dtype=float)
     if work_dir is None:
@@ -1000,7 +1049,7 @@ def run_openfoam_drag(
         n_processors=n_processors,
         reference_area=reference_area,
     )
-    log_path = _run_openfoam_commands(case_dir, n_processors=n_processors)
+    log_path = _run_openfoam_commands(case_dir, runner)
 
     coefficients_file = find_force_coeffs_file(case_dir)
     if coefficients_file is None:
@@ -1048,6 +1097,7 @@ def run_openfoam_drag(
             "refinement_level": refinement_level,
             "moving_ground": moving_ground,
             "n_processors": n_processors,
+            "execution": runner.describe(),
             "background_cells": setup["cells"],
         },
     )

@@ -1,0 +1,81 @@
+# SU2 8.4.0, built from source with MPI.
+#
+# Built rather than downloaded: SU2's precompiled binaries have parallel
+# support explicitly disabled ("simply the serial version of the SU2 C++
+# modules"), and su2._run_su2_command dispatches through mpirun. Pulling the
+# release tarball would silently cost every core on the machine.
+#
+# Two flags from setup.sh are deliberately dropped:
+#
+#   -Denable-cuda      SU2's CUDA path is experimental, covers only the linear
+#                      solver, and needs nvidia-container-toolkit plus NVIDIA
+#                      hardware -- which would make the image unrunnable on
+#                      anything else. These containers are CPU-only.
+#   -Denable-pywrapper  Nothing imports pysu2; the backend invokes the SU2_CFD
+#                      executable as a subprocess. Dropping it also removes
+#                      swig and mpi4py from the build.
+#
+# ParMETIS ships inside SU2's externals/ and is built automatically, so
+# -Dwith-mpi=enabled needs no extra packages beyond OpenMPI itself.
+
+# ---------------------------------------------------------------- build stage
+FROM ubuntu:24.04 AS build
+
+ARG SU2_VERSION=v8.4.0
+ARG SU2_PREFIX=/opt/su2
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        git \
+        libopenmpi-dev \
+        openmpi-bin \
+        pkg-config \
+        python3 \
+        python3-distutils \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git clone --branch "${SU2_VERSION}" --depth 1 https://github.com/su2code/SU2.git . \
+    && git submodule update --init --recursive --depth 1
+
+# preconfigure.py fetches SU2's own pinned meson, which is why the build does
+# not use the distro's.
+RUN python3 ./preconfigure.py --with-own-meson \
+    && ./meson.py setup build \
+        --prefix="${SU2_PREFIX}" \
+        -Dwith-mpi=enabled \
+        --buildtype=release \
+    && ./ninja -C build install
+
+# -------------------------------------------------------------- runtime stage
+# Separate so the image ships the binaries without the toolchain and the
+# checked-out source, which together are several GB.
+FROM ubuntu:24.04
+
+ARG SU2_PREFIX=/opt/su2
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+        openmpi-bin \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build ${SU2_PREFIX} ${SU2_PREFIX}
+
+# su2.CONTAINER_SU2_BIN must match this prefix.
+ENV SU2_RUN=${SU2_PREFIX}/bin \
+    PATH=${SU2_PREFIX}/bin:$PATH
+
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    HOME=/tmp
+
+WORKDIR /case
+
+CMD ["bash"]
