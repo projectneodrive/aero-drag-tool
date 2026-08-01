@@ -72,16 +72,6 @@
       <dl class="factrow" id="shape-facts"></dl>
     </section>
 
-    <section class="group" id="packaging-block" hidden>
-      <h2 class="group-title">Shape search</h2>
-      <div id="controls-packaging" class="controls"></div>
-      <p class="hint">
-        The shell is always <strong>one closed body</strong>. The sweep finds the
-        smallest closing radius that merges the payload into a single lump and
-        builds there — separate pods would leave a choked channel between them.
-      </p>
-    </section>
-
     <section class="group param-block" hidden>
       <h2 class="group-title">Wind</h2>
       <div id="controls-wind" class="controls"></div>
@@ -104,8 +94,25 @@
       <div id="controls-fluid" class="controls"></div>
     </section>
 
-    <section class="group param-block" id="solver-block" hidden>
-      <h2 class="group-title">Solver</h2>
+    <!-- Each verb lives in the section holding the settings it uses, so what a
+         button is about to do is answered by what is directly above it. -->
+    <section class="group param-block action-block" id="packaging-block" hidden>
+      <h2 class="group-title">Shape search</h2>
+      <div id="controls-packaging" class="controls"></div>
+      <p class="hint">
+        The shell is always <strong>one closed body</strong>. The sweep finds the
+        smallest closing radius that merges the payload into a single lump and
+        builds there — separate pods would leave a choked channel between them.
+      </p>
+
+      <div class="action">
+        <button id="btn-derive" class="btn btn-shape btn-wide">Derive a lower-drag shape</button>
+        <p class="btn-why" id="derive-why"></p>
+      </div>
+    </section>
+
+    <section class="group param-block action-block" id="solver-block" hidden>
+      <h2 class="group-title">Solve</h2>
 
       <div class="control">
         <label class="control-label" for="quality-select">Quality</label>
@@ -128,6 +135,12 @@
         <summary>Advanced</summary>
         <div id="controls-solver" class="controls"></div>
       </details>
+
+      <div class="action">
+        <button id="btn-compute" class="btn btn-primary btn-wide">Compute drag</button>
+        <div id="eta-estimate" class="btn-eta"></div>
+        <p class="btn-why" id="compute-why"></p>
+      </div>
     </section>
   </aside>
 
@@ -240,16 +253,6 @@
 
   </aside>
 </main>
-
-<!-- Two verbs, always the same two, always acting on the tab you are in. -->
-<footer class="actionbar" id="actionbar" hidden>
-  <div class="actionbar-buttons">
-    <button id="btn-compute" class="btn btn-primary btn-big">Compute drag</button>
-    <button id="btn-derive" class="btn btn-shape btn-big">Derive a lower-drag shape</button>
-  </div>
-  <div class="actionbar-text" id="actionbar-text"></div>
-  <div class="actionbar-right" id="actionbar-right"></div>
-</footer>
 
 <!-- ------------------------------------------------------------- modal -->
 <div id="library-modal" class="modal" hidden>

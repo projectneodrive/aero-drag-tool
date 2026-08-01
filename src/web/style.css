@@ -158,7 +158,10 @@ body {
 .btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
 
 .btn-quiet { background: transparent; color: var(--text-secondary); }
-.btn-wide { width: 100%; }
+
+/* nowrap is right for a toolbar button, but a full-width one in a 300px panel
+   has to wrap its label rather than push its own text out of sight. */
+.btn-wide { width: 100%; white-space: normal; }
 
 /* The second verb. Orange because deriving a shape is the shape-run colour,
    the same hue its tab and its sweep chart carry. */
@@ -169,7 +172,6 @@ body {
   font-weight: 600;
 }
 .btn-shape:hover:not(:disabled) { filter: brightness(1.08); }
-.btn-big { font-size: 13px; padding: 8px 18px; }
 
 .text-input {
   font: inherit;
@@ -849,36 +851,35 @@ table.data thead th {
   margin-bottom: 4px;
 }
 
-/* --------------------------------------------------------- action bar */
+/* ------------------------------------------------------------- actions
 
-/* The two verbs, in a bar that spans the run they act on. Nothing else in
-   the window starts work, so "which shape is this about to fly" is answered
-   by the tab you are in. */
-.actionbar {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 10px 16px;
-  background: var(--panel);
+   Each verb closes the section holding the settings it uses, separated by a
+   rule so it reads as "…and now do it" rather than as one more control. */
+
+.action {
+  margin-top: 14px;
+  padding-top: 12px;
   border-top: 1px solid var(--border);
 }
 
-.actionbar-buttons { display: flex; gap: 9px; flex: none; }
+.action .btn { padding: 7px 11px; }
 
-.actionbar-text { font-size: 11.5px; color: var(--text-muted); min-width: 0; }
-.actionbar-text b { color: var(--text-secondary); font-weight: 600; }
+.btn-why {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.btn-why b { color: var(--text-secondary); font-weight: 600; }
 
-.actionbar-right {
-  margin-left: auto;
+.btn-eta {
+  margin-top: 6px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   font-size: 11.5px;
   color: var(--text-secondary);
-  white-space: nowrap;
 }
-.actionbar-right strong { color: var(--text-primary); }
+.btn-eta strong { color: var(--text-primary); font-weight: 600; }
 
 /* ------------------------------------------------------------- modal */
 

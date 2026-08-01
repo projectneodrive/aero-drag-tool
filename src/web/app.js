@@ -1571,74 +1571,89 @@ function renderProgress() {
   log.scrollTop = log.scrollHeight;
 }
 
-/* ------------------------------------------------------------ action bar */
+/* --------------------------------------------------------------- actions
+
+   Each verb sits in the section holding the settings it uses -- solve under
+   the quality and backends, derive under the packaging knobs -- so what a
+   button is about to do is answered by what is directly above it. */
 
 function renderActions() {
   const run = state.run;
-  $('actionbar').hidden = !run;
-  if (!run) return;
-
   const compute = $('btn-compute');
   const derive = $('btn-derive');
-  const text = $('actionbar-text');
-  const right = $('actionbar-right');
-  text.textContent = '';
-  right.textContent = '';
+  const computeWhy = $('compute-why');
+  const deriveWhy = $('derive-why');
+  const eta = $('eta-estimate');
+  computeWhy.textContent = '';
+  deriveWhy.textContent = '';
+  eta.textContent = '';
+  if (!run) return;
 
   const busyElsewhere = Boolean(state.runningId && state.runningId !== run.id);
   const isRunning = run.status === 'running';
   const isShape = run.kind === 'shape';
-
-  compute.textContent = isShape ? 'Compute drag on the shell' : 'Compute drag';
-  derive.textContent = isShape ? 'Derive again' : 'Derive a lower-drag shape';
-
   const noBackends = (run.scene.solver.backends || []).length === 0;
+
+  compute.textContent = isRunning
+    ? 'Solving…'
+    : isShape ? 'Compute drag on the shell' : 'Compute drag';
+  derive.textContent = isRunning && isShape
+    ? 'Building…'
+    : isShape ? 'Derive again' : 'Derive a lower-drag shape';
+
   compute.disabled = isRunning || busyElsewhere || noBackends || (isShape && !run.shell);
   derive.disabled = isRunning || busyElsewhere;
 
-  if (isRunning) {
-    compute.textContent = 'Solving…';
-    text.append(document.createTextNode('This run is working. '));
-    text.append(el('b', null, 'Its parameters are frozen; every other tab stays live.'));
-  } else if (busyElsewhere) {
-    const busy = state.runs.find((item) => item.id === state.runningId);
-    text.append(document.createTextNode('One solve at a time — '));
-    text.append(el('b', null, busy ? busy.title : 'another run'));
-    text.append(document.createTextNode(' is running. Reading and editing this run is unaffected.'));
-  } else if (noBackends) {
-    text.append(document.createTextNode('Select at least one solver on the left.'));
-  } else if (isShape) {
-    text.append(document.createTextNode(
-      run.shell
-        ? 'Opens the shell as its own run and solves it. Deriving again re-wraps the same payload. '
-        : 'Build the shell first. ',
-    ));
-    text.append(el('b', null, 'This run stays as it is.'));
-  } else if (run.results?.runs?.length) {
-    text.append(document.createTextNode('Opens a new run carrying '));
-    text.append(el('b', null,
-      run.changed?.length
-        ? `your ${run.changed.length} changed parameter${run.changed.length === 1 ? '' : 's'}`
-        : 'the same parameters'));
-    text.append(document.createTextNode('. This one is kept.'));
+  // A blocked button says why it is blocked; that reason outranks whatever the
+  // button would otherwise have explained about itself.
+  const blocked = isRunning
+    ? 'This run is working. Its parameters are frozen; every other tab stays live.'
+    : busyElsewhere
+      ? `One solve at a time — ${
+        state.runs.find((item) => item.id === state.runningId)?.title || 'another run'
+      } is running. Reading and editing this run is unaffected.`
+      : null;
+
+  if (blocked) {
+    computeWhy.textContent = blocked;
+    deriveWhy.textContent = blocked;
   } else {
-    text.append(document.createTextNode('Solves into this run, '));
-    text.append(el('b', null, run.title));
-    text.append(document.createTextNode(' — it has no results to overwrite yet.'));
+    if (noBackends) {
+      computeWhy.textContent = 'Tick at least one solver above.';
+    } else if (isShape) {
+      computeWhy.textContent = run.shell
+        ? 'Opens the shell as its own run and solves it. This run stays as it is.'
+        : 'Build the shell first.';
+    } else if (run.results?.runs?.length) {
+      computeWhy.append(document.createTextNode('Opens a new run carrying '));
+      computeWhy.append(el('b', null,
+        run.changed?.length
+          ? `your ${run.changed.length} changed parameter${run.changed.length === 1 ? '' : 's'}`
+          : 'the same parameters'));
+      computeWhy.append(document.createTextNode('. This one is kept.'));
+    } else {
+      computeWhy.textContent = 'Solves into this run — it has no results to overwrite yet.';
+    }
+
+    deriveWhy.textContent = isShape
+      ? 'Re-wraps the same payload with these settings, as a new run.'
+      : 'Wraps this shape in one closed shell, as a new run. This one is kept.';
   }
 
   if (isRunning) {
     const job = state.job && state.job.run_id === run.id ? state.job : null;
-    right.append(el('span', 'glyph glyph-running'));
+    eta.append(el('span', 'glyph glyph-running'));
     if (job?.progress) {
-      right.append(document.createTextNode(`${job.progress.units_done}/${job.progress.units_total} solves · `));
-      right.append(el('strong', null, `~${job.progress.remaining_text} left`));
+      eta.append(el('strong', null, `~${job.progress.remaining_text} left`));
+      eta.append(document.createTextNode(
+        ` · ${job.progress.units_done}/${job.progress.units_total} solves`,
+      ));
     } else {
-      right.append(document.createTextNode('starting…'));
+      eta.append(document.createTextNode('starting…'));
     }
   } else if (run.estimate && !isShape) {
-    right.append(el('strong', null, `~${formatDuration(run.estimate.total_seconds)}`));
-    right.append(document.createTextNode(
+    eta.append(el('strong', null, `~${formatDuration(run.estimate.total_seconds)}`));
+    eta.append(document.createTextNode(
       run.estimate.calibrated
         ? ` estimated, from ${run.estimate.samples} past solves`
         : ' estimated (uncalibrated)',
@@ -1740,11 +1755,10 @@ function render() {
   renderLegend();
 
   const isShape = run?.kind === 'shape';
-  $('packaging-block').hidden = !isShape;
-  $('solver-block').hidden = !run || isShape;
-  for (const block of document.querySelectorAll('.param-block')) {
-    block.hidden = !run || (isShape && block.id === 'solver-block');
-  }
+  // Both action sections show on every run: the packaging knobs have to be
+  // settable *before* deriving, and a shape run's solver settings are the ones
+  // its shell inherits when it is opened as a run.
+  for (const block of document.querySelectorAll('.param-block')) block.hidden = !run;
   $('freeze-block').hidden = run?.status !== 'running';
   $('empty-results').hidden = Boolean(
     !run || run.status === 'running' || run.status === 'failed'
