@@ -29,6 +29,7 @@ offline round trip still works:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import struct
 import threading
@@ -74,7 +75,7 @@ class Job:
         self.run_id = run_id
         self.kind = kind
         self.backends = list(backends or [])
-        self.status = "running"
+        self.status = "queued"
         self.events: list[dict] = []
         self.error: str | None = None
         self.started = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -107,12 +108,87 @@ class Job:
                 "error": self.error,
                 "estimate": self.estimate,
                 "progress": self.progress,
+                "position": queue.position(self.id),
             }
+
+
+class JobQueue:
+    """One solve at a time, but you never have to wait to ask for the next.
+
+    The solvers want the whole machine -- two OpenFOAM runs sharing the cores
+    take longer together than one after the other, and the runtime history
+    would learn from timings that mean nothing. So the *execution* stays
+    serial while the *asking* does not: press compute on as many runs as you
+    like and they line up.
+
+    A queued run's parameters are frozen from the moment it joins the line,
+    not from when it reaches the front. The alternative -- editable until it
+    starts -- means what is on screen while it waits is not what will be run,
+    which is exactly the confusion the run model exists to remove.
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition(threading.Lock())
+        self._pending: list[tuple[Job, object]] = []
+        self._current: Job | None = None
+        threading.Thread(target=self._loop, name="aero-queue", daemon=True).start()
+
+    def submit(self, job: Job, work) -> None:
+        with self._cv:
+            self._pending.append((job, work))
+            self._cv.notify()
+
+    def cancel(self, job_id: str) -> bool:
+        """Drop a job that has not started. A running one is left alone."""
+        with self._cv:
+            for index, (job, _) in enumerate(self._pending):
+                if job.id == job_id:
+                    self._pending.pop(index)
+                    job.status = "cancelled"
+                    return True
+            return False
+
+    def position(self, job_id: str) -> int | None:
+        """0 while running, 1 and up while waiting, None once it is over."""
+        with self._cv:
+            if self._current is not None and self._current.id == job_id:
+                return 0
+            for index, (job, _) in enumerate(self._pending):
+                if job.id == job_id:
+                    return index + 1
+            return None
+
+    def current(self) -> Job | None:
+        with self._cv:
+            return self._current
+
+    def waiting(self) -> list[Job]:
+        with self._cv:
+            return [job for job, _ in self._pending]
+
+    def _loop(self) -> None:
+        while True:
+            with self._cv:
+                while not self._pending:
+                    self._cv.wait()
+                job, work = self._pending.pop(0)
+                self._current = job
+            try:
+                job.status = "running"
+                job.started_at = time.time()
+                work()
+            except Exception as error:  # a worker that dies must not stall the queue
+                job.status = "failed"
+                job.error = f"{type(error).__name__}: {error}"
+                job.add_event({"phase": "error", "message": job.error})
+            finally:
+                with self._cv:
+                    self._current = None
 
 
 store = RunStore()
 jobs: dict[str, Job] = {}
-jobs_lock = threading.Lock()
+queue = JobQueue()
 
 app = FastAPI(title="Aero drag tool")
 
@@ -130,22 +206,17 @@ def require_run(run_id: str) -> Run:
 
 
 def require_idle(run: Run) -> None:
-    """Refuse to mutate a run the solver is currently reading."""
-    if run.status == "running":
+    """Refuse to mutate a run that is committed to the queue.
+
+    Frozen from the moment it joins the line, not from when it starts: a run
+    whose parameters could still move while it waited would be shown on screen
+    as something other than what is about to be solved.
+    """
+    if run.status in ("running", "queued"):
+        state = "solving" if run.status == "running" else "queued"
         raise HTTPException(
             status_code=409,
-            detail=f"{run.title} is solving. Its parameters are frozen until it finishes.",
-        )
-
-
-def claim_job_slot() -> None:
-    """One solve at a time, so two jobs never fight over the same cores."""
-    busy = store.running()
-    if busy is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"{busy.title} is already running. One solve at a time — "
-            "reading and editing other runs is unaffected.",
+            detail=f"{run.title} is {state}. Its parameters are frozen until it finishes.",
         )
 
 
@@ -157,12 +228,72 @@ def display_scene(run: Run) -> Scene:
     viewport, the metrics and the payload placement all derive from one
     geometry, so the picture of the payload sitting inside the shell cannot
     disagree with the numbers beside it.
+
+    Shallow, not deep: every caller only reads. A deep copy would clone the
+    embedded base64 STL, which on a 60k-triangle shell is megabytes of string
+    copying on a request that is meant to be instant.
     """
     if run.kind == "shape" and run.shell_geometry is not None:
-        scene = run.scene.copy()
+        scene = copy.copy(run.scene)
         scene.geometry = run.shell_geometry
         return scene
     return run.scene
+
+
+# Probing for OpenFOAM and SU2 shells out to WSL or Docker, which costs the
+# best part of a second. What it finds changes when somebody installs a
+# solver, not between two clicks, so it is worth a short memo.
+SOLVER_PROBE_SECONDS = 30.0
+_solver_probe: tuple[float, int | None, list[dict]] | None = None
+
+
+def solver_infos(processes: int | None) -> list[dict]:
+    global _solver_probe
+    now = time.time()
+    if (
+        _solver_probe is not None
+        and _solver_probe[1] == processes
+        and now - _solver_probe[0] < SOLVER_PROBE_SECONDS
+    ):
+        return _solver_probe[2]
+    infos = [info.to_dict() for info in available_solvers(processes)]
+    _solver_probe = (now, processes, infos)
+    return infos
+
+
+# A run's geometry never changes once it exists -- edits go to a fork, and the
+# only in-place swap is a shape run gaining its shell. So the frontal-area
+# rasterisation only has to be redone when the placement or the wind moves.
+_metrics_cache: dict[str, tuple[tuple, dict, dict, str]] = {}
+
+
+def cached_view(run: Run, scene: Scene) -> tuple[dict, dict, str]:
+    """Metrics, Reynolds advice and the resolved speed mode for a run."""
+    key = (
+        bool(run.shell_geometry),
+        round(scene.orientation.yaw_deg, 4),
+        round(scene.orientation.pitch_deg, 4),
+        round(scene.orientation.roll_deg, 4),
+        round(scene.wind.azimuth_deg, 4),
+        round(scene.wind.elevation_deg, 4),
+        scene.road.enabled,
+        round(scene.road.ride_height, 6),
+        round(scene.solver.speed_min, 4),
+        round(scene.solver.speed_max, 4),
+        scene.solver.sweep_mode,
+        round(scene.fluid.density, 6),
+        round(scene.fluid.viscosity, 12),
+    )
+    hit = _metrics_cache.get(run.id)
+    if hit is not None and hit[0] == key:
+        return hit[1], hit[2], hit[3]
+
+    metrics = scene.metrics()
+    advice = scene.reynolds_advice(metrics.streamwise_length)
+    mode, _ = scene.resolved_sweep_mode(metrics.streamwise_length)
+    entry = (metrics.to_dict(), advice.to_dict(), mode)
+    _metrics_cache[run.id] = (key, *entry)
+    return entry
 
 
 def reference_run(run: Run) -> dict | None:
@@ -209,17 +340,15 @@ def _reference_point(run: Run) -> dict | None:
 def run_payload(run: Run) -> dict:
     """Everything one run's panels need, minus the STL blobs."""
     scene = display_scene(run)
-    metrics = scene.metrics()
-    advice = scene.reynolds_advice(metrics.streamwise_length)
-    mode, _ = scene.resolved_sweep_mode(metrics.streamwise_length)
+    metrics, advice, mode = cached_view(run, scene)
 
     payload = run.to_dict()
     payload.update(
         {
-            "metrics": metrics.to_dict(),
-            "reynolds": advice.to_dict(),
+            "metrics": metrics,
+            "reynolds": advice,
             "resolved_mode": mode,
-            "estimate": estimates.estimate_scene(scene),
+            "estimate": estimates.estimate_scene(scene, mode=mode),
             "results": scene.results.to_dict() if scene.results else None,
             "drag_area": None,
             "reference": reference_run(run),
@@ -238,24 +367,42 @@ def run_payload(run: Run) -> dict:
     return payload
 
 
+def activity_payload() -> dict:
+    """Everything that changes on its own, in one request.
+
+    The browser polls this while anything is in flight, so the tab bar, the
+    queue positions and the running job's progress all arrive together rather
+    than as three round trips that can disagree with each other.
+    """
+    current = queue.current()
+    return {
+        "runs": store.summaries(),
+        "active_id": store.active_id,
+        "running": current.snapshot() if current is not None else None,
+        "queue": [
+            {"job_id": job.id, "run_id": job.run_id, "position": queue.position(job.id)}
+            for job in queue.waiting()
+        ],
+    }
+
+
 def state_payload() -> dict:
-    busy = store.running()
     processes = None
     active = store.get(store.active_id) if store.active_id else None
     if active is not None:
         processes = active.scene.solver.processes
-    return {
-        "runs": store.summaries(),
-        "active_id": store.active_id,
-        "running_id": busy.id if busy else None,
-        "running_job": busy.job_id if busy else None,
-        "solvers": [info.to_dict() for info in available_solvers(processes)],
-        "cores": {
-            "available": available_cores(),
-            "default_processes": default_processes(),
-            "processes": processes,
-        },
-    }
+    payload = activity_payload()
+    payload.update(
+        {
+            "solvers": solver_infos(processes),
+            "cores": {
+                "available": available_cores(),
+                "default_processes": default_processes(),
+                "processes": processes,
+            },
+        }
+    )
+    return payload
 
 
 def encode_mesh(mesh, crease_deg: float = 30.0) -> bytes:
@@ -345,12 +492,16 @@ def get_state() -> dict:
     return state_payload()
 
 
+@app.get("/api/activity")
+def get_activity() -> dict:
+    """The poll endpoint: run states, the queue and the running job's progress."""
+    return activity_payload()
+
+
 @app.get("/api/solvers")
 def get_solvers() -> dict:
-    return {
-        "solvers": state_payload()["solvers"],
-        "cores": state_payload()["cores"],
-    }
+    payload = state_payload()
+    return {"solvers": payload["solvers"], "cores": payload["cores"]}
 
 
 @app.get("/api/runs/{run_id}")
@@ -360,16 +511,48 @@ def get_run(run_id: str) -> dict:
 
 @app.post("/api/runs/{run_id}/activate")
 def activate_run(run_id: str) -> dict:
+    """Remember which tab is in front, for a page reload. Nothing else.
+
+    Deliberately does not return the state: the browser fires this off and
+    moves on, and building a full state payload here meant re-probing for
+    solvers on every tab switch.
+    """
     require_run(run_id)
     store.active_id = run_id
-    return state_payload()
+    return {"active_id": run_id}
+
+
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_run(run_id: str) -> dict:
+    """Take a run back out of the queue. A running one has to finish."""
+    run = require_run(run_id)
+    if run.status != "queued" or not run.job_id:
+        raise HTTPException(status_code=409, detail=f"{run.title} is not waiting in the queue")
+    if not queue.cancel(run.job_id):
+        raise HTTPException(status_code=409, detail=f"{run.title} has already started")
+    # Cancelling releases the inputs again, so the run goes back to what it was
+    # before it was asked for. Nothing went wrong, so it is not a failure.
+    run.status = "done" if run.computed else "draft"
+    run.job_id = None
+    if not run.computed:
+        run.solved_params = None
+    return {"run": run_payload(run), "state": state_payload()}
 
 
 @app.delete("/api/runs/{run_id}")
 def close_run(run_id: str) -> dict:
     run = require_run(run_id)
-    require_idle(run)
+    # Closing a tab that is still waiting simply takes it out of the line;
+    # only a run already on the solver has to be seen through.
+    if run.status == "queued" and run.job_id:
+        queue.cancel(run.job_id)
+    elif run.status == "running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{run.title} is solving. Let it finish before closing it.",
+        )
     store.remove(run_id)
+    _metrics_cache.pop(run_id, None)
     return state_payload()
 
 
@@ -523,7 +706,6 @@ def compute_run(run_id: str, body: dict | None = None) -> dict:
     """
     run = require_run(run_id)
     require_idle(run)
-    claim_job_slot()
 
     body = body or {}
     backends = body.get("backends") or run.scene.solver.backends
@@ -546,19 +728,20 @@ def compute_run(run_id: str, body: dict | None = None) -> dict:
     target.scene.solver.backends = backends
     scene = target.scene
 
-    with jobs_lock:
-        job = Job(target.id, kind="drag", backends=backends)
-        jobs[job.id] = job
+    job = Job(target.id, kind="drag", backends=backends)
+    jobs[job.id] = job
 
-    target.status = "running"
+    target.status = "queued"
     target.job_id = job.id
     target.error = None
-    # Snapshot now, not at the end: these are the values the solver is being
-    # handed, and the panel is frozen from this moment so they cannot drift.
+    # Snapshot at enqueue, not when the solver starts: the panel is frozen from
+    # this moment, so these are the values that will be handed over whenever
+    # the queue reaches this run.
     target.solved_params = target.snapshot_parameters()
-    started = time.time()
 
     def worker() -> None:
+        started = time.time()
+        target.status = "running"
         try:
             results = run_scene(scene, backends=backends, progress=job.add_event)
             results.title = target.title
@@ -579,7 +762,7 @@ def compute_run(run_id: str, body: dict | None = None) -> dict:
             job.error = target.error
             job.add_event({"phase": "error", "message": target.error})
 
-    threading.Thread(target=worker, name=f"aero-drag-{job.id}", daemon=True).start()
+    queue.submit(job, worker)
     return {
         "run_id": target.id,
         "forked": forked,
@@ -604,7 +787,6 @@ def derive_shape(run_id: str) -> dict:
     would quietly compound the clearance on every pass.
     """
     parent = require_run(run_id)
-    claim_job_slot()
 
     if parent.kind == "shape" and parent.scene.payload is not None:
         payload_geometry = parent.scene.payload
@@ -630,14 +812,12 @@ def derive_shape(run_id: str) -> dict:
         )
     )
 
-    with jobs_lock:
-        job = Job(run.id, kind="shape")
-        jobs[job.id] = job
+    job = Job(run.id, kind="shape")
+    jobs[job.id] = job
 
-    run.status = "running"
+    run.status = "queued"
     run.job_id = job.id
     run.solved_params = run.snapshot_parameters()
-    started = time.time()
 
     packaging = scene.packaging
     payload_mesh = payload_geometry.raw_mesh()
@@ -647,6 +827,8 @@ def derive_shape(run_id: str) -> dict:
     )
 
     def worker() -> None:
+        started = time.time()
+        run.status = "running"
         try:
             job.add_event({"phase": "voxelise", "message": "Voxelising the payload"})
             coarse = fairing_module.build_grid(
@@ -742,7 +924,7 @@ def derive_shape(run_id: str) -> dict:
             job.error = run.error
             job.add_event({"phase": "error", "message": run.error})
 
-    threading.Thread(target=worker, name=f"aero-shape-{job.id}", daemon=True).start()
+    queue.submit(job, worker)
     return {
         "run_id": run.id,
         "job": job.snapshot(),
@@ -753,15 +935,28 @@ def derive_shape(run_id: str) -> dict:
 
 @app.post("/api/runs/{run_id}/adopt")
 def adopt_shell(run_id: str) -> dict:
-    """Open a shape run's shell as a drag run, ready to solve."""
+    """Open a shape run's shell as a drag run: a plain STL, ready to solve.
+
+    The payload and the fairing spec are deliberately *not* carried over. What
+    has to fit inside is a question about designing the shape, and the shape
+    run is where it is asked and answered -- there it draws the payload through
+    a ghosted shell and verifies containment. Once the shell exists it is a
+    body flying through air, and the solver has no more interest in what is
+    inside it than in what is inside any other imported STL.
+
+    Keeping the payload here would ghost the hull in the viewport and drag a
+    second mesh through every placement and download, all to depict a
+    relationship that no longer bears on the number being computed. The
+    lineage line still names where it came from.
+    """
     parent = require_run(run_id)
     if parent.kind != "shape" or parent.shell_geometry is None:
         raise HTTPException(status_code=409, detail="That run has no shell to open")
 
     scene = parent.scene.without_results()
     scene.geometry = parent.shell_geometry
-    scene.payload = parent.scene.payload
-    scene.fairing = parent.scene.fairing
+    scene.payload = None
+    scene.fairing = None
 
     base = f"{base_name(parent.title)} shell"
     scene.name = base

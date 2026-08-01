@@ -161,19 +161,26 @@ def estimate_evaluation(
     return float(max(overhead + rate * work, 1.0))
 
 
-def estimate_scene(scene, backends: list[str] | None = None) -> dict:
+def estimate_scene(scene, backends: list[str] | None = None, mode: str | None = None) -> dict:
     """Predicted seconds for a whole run, broken down per backend.
 
     Accounts for the speed-curve strategy: a sweep solves every point, while
     scaling solves once and extrapolates.
+
+    ``mode`` short-circuits resolving that strategy here. Working it out means
+    measuring the body along the flow, which means decoding and placing the
+    mesh -- a sixth of a second on a 60k-triangle shell, paid on every request
+    that shows an estimate. Callers that have just placed the mesh already
+    know the answer.
     """
     backends = list(backends if backends is not None else scene.solver.backends)
     history = load_history()
 
-    try:
-        mode, _ = scene.resolved_sweep_mode()
-    except Exception:
-        mode = scene.solver.sweep_mode if scene.solver.sweep_mode in {"scale", "sweep"} else "sweep"
+    if mode is None:
+        try:
+            mode, _ = scene.resolved_sweep_mode()
+        except Exception:
+            mode = scene.solver.sweep_mode if scene.solver.sweep_mode in {"scale", "sweep"} else "sweep"
 
     points = len(scene.solver.speeds())
     per_backend: dict[str, dict] = {}

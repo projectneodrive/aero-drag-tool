@@ -273,7 +273,24 @@ prints which one each backend resolved to.
 python src/runner.py info  # confirm they were picked up
 ```
 
-Two images, because the two solvers share no useful base:
+Or run the whole thing as a compose stack, GUI included:
+
+```bash
+docker compose --profile solvers pull   # published images from GHCR, no compile
+docker compose up web                   # then open http://127.0.0.1:8000
+```
+
+`docker-compose.yml` pulls the images that `.github/workflows/containers.yml`
+publishes on every release tag — which is the point: the SU2 image compiles
+from source, and pulling it skips that entirely. Its twin
+`docker-compose-local.yml` is the same stack built from the checkout, for
+unreleased changes or machines without registry access. Either way the GUI
+container launches the solver containers as *siblings* through the host's
+Docker socket, and case directories live on the identity-mounted
+`/tmp/aero-cases` — inside the Docker Desktop VM on Windows, which is the fast
+side of the filesystem boundary described below.
+
+Two images for the solvers, because they share no useful base:
 
 - **OpenFOAM** installs v13 from the Foundation's apt repository. There is no
   official v13 image to pull — [hub.docker.com/u/openfoam](https://hub.docker.com/u/openfoam)
@@ -438,7 +455,8 @@ directly. The containers do not have this problem: they set `PATH` through
 | `src/openfoam.py` | OpenFOAM case generation and run |
 | `src/su2.py` | SU2 case generation and run |
 | `src/execution.py` | Where the solvers run (native/Docker/WSL) and how many ranks they get |
-| `docker/` | Solver images and their build scripts |
+| `docker/` | Solver and GUI images, and the solver build scripts |
+| `docker-compose.yml` | The stack on published GHCR images; `-local.yml` builds instead |
 | `src/runner.py` | Command line: info / new / run / show / fair / compare / export |
 | `src/drag.py` | SU2-flavoured entry point into the same CLI |
 

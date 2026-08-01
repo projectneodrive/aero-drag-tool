@@ -239,8 +239,17 @@ body {
 .glyph-draft { background: transparent; border: 1.5px dashed var(--axis); }
 .glyph-failed { background: var(--critical); }
 .glyph-running { background: var(--warning); animation: pulse 1.1s ease-in-out infinite; }
+/* Waiting, not working: the same amber as running, but hollow and still. */
+.glyph-queued { background: transparent; border: 1.5px solid var(--warning); }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+.tab-queue {
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--warning);
+}
 
 /* A solving run reports progress from every tab, not only its own. */
 .tab-progress {
@@ -880,6 +889,18 @@ table.data thead th {
   color: var(--text-secondary);
 }
 .btn-eta strong { color: var(--text-primary); font-weight: 600; }
+
+.link-button {
+  font: inherit;
+  font-size: 11px;
+  color: var(--series-openfoam);
+  background: none;
+  border: 0;
+  padding: 0;
+  margin-left: auto;
+  cursor: pointer;
+  border-bottom: 1px dotted currentColor;
+}
 
 /* ------------------------------------------------------------- modal */
 

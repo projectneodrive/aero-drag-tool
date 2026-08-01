@@ -1,0 +1,94 @@
+# Build the three images and publish them to GHCR on every release tag.
+#
+# Release-driven on purpose: the solver Dockerfiles pin their versions
+# (OpenFOAM 13, SU2 8.4.0), so rebuilding them per commit would burn an hour
+# of CI compiling the same SU2 over and over. A `v*` tag is the statement
+# "this is a version people will pull", which is exactly when the published
+# images should refresh. workflow_dispatch covers the in-between case of a
+# changed Dockerfile that needs publishing without a release.
+#
+# No build cache, also on purpose: releases are rare, and SU2's build-stage
+# cache runs to gigabytes -- slower to ship in and out of the cache backend
+# than the rebuild it would save.
+#
+# linux/amd64 only. The SU2 compile under qemu emulation would take the
+# better part of a day, and the solvers are CPU-bound tools nobody has asked
+# to run on arm yet.
+
+name: containers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Tags must match what the tool launches: execution.OPENFOAM_IMAGE
+          # and execution.SU2_IMAGE name the version, the web image tracks
+          # releases. docker-compose.yml points AERO_*_IMAGE at these names.
+          - image: openfoam
+            dockerfile: docker/Dockerfile.openfoam
+            context: docker
+            version: "13"
+          - image: su2
+            dockerfile: docker/Dockerfile.su2
+            context: docker
+            version: "8.4.0"
+          - image: web
+            dockerfile: docker/Dockerfile.web
+            context: .
+            version: latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The SU2 source tree plus its build objects need room the stock
+      # runner does not reliably have; the preinstalled .NET and Android
+      # SDKs are the cheapest tens of gigabytes to reclaim.
+      - name: Free disk space for the SU2 compile
+        if: matrix.image == 'su2'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        run: |
+          base="ghcr.io/${GITHUB_REPOSITORY,,}/${{ matrix.image }}"
+          tags="$base:${{ matrix.version }}"
+          # The web image also carries the release number, so an old GUI can
+          # be pulled back after :latest has moved on. The solver images do
+          # not: their tag *is* their solver version.
+          if [[ "${{ matrix.image }}" == "web" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tags="$tags"$'\n'"$base:${GITHUB_REF_NAME#v}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # Links the GHCR package to this repository.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}

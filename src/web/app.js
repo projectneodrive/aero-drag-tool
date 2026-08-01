@@ -76,13 +76,17 @@ const state = {
   run: null,          // the full payload of the run on screen
   solvers: [],
   cores: null,
-  runningId: null,    // which run is solving, whichever tab you are looking at
-  runningJob: null,
-  job: null,
-  jobTimer: null,
+  running: null,      // the job snapshot of whatever is on the solver
+  queue: [],          // [{job_id, run_id, position}] waiting behind it
+  pollTimer: null,
+  polling: false,
   resultView: 'chart',
   chartHover: null,
   meshKey: null,      // what the viewport currently holds
+  // Switching tabs should not wait on the network. Payloads are rendered from
+  // here first and revalidated behind the scenes; anything whose status moves
+  // is dropped so the next visit refetches.
+  runCache: new Map(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -197,6 +201,17 @@ const viewport = (() => {
   const hullGroup = new THREE.Group();
   scene.add(hullGroup);
 
+  // Built meshes are kept per run so switching back to a tab is a swap rather
+  // than a decode plus an EdgesGeometry pass. Six is enough to cover the tabs
+  // anyone flicks between; past that the oldest is disposed.
+  const entries = new Map();
+  const MAX_ENTRIES = 6;
+
+  // EdgesGeometry walks every shared edge, which on a 60k-triangle fairing
+  // costs more than the rest of the frame and finds almost nothing: a smooth
+  // shell has no 28-degree creases. It earns its cost on a faceted payload.
+  const EDGE_TRIANGLE_LIMIT = 20000;
+
   let hullMesh = null;
   let hullEdges = null;
   let payloadMesh = null;
@@ -228,44 +243,6 @@ const viewport = (() => {
     };
   }
 
-  /* The payload is a child of the hull group, so it inherits exactly the same
-     placement transform. Anything else risks drawing it somewhere it is not,
-     which would make "does it fit" a lie. */
-  function setPayload(buffer) {
-    if (payloadMesh) {
-      hullGroup.remove(payloadMesh);
-      payloadMesh.geometry.dispose();
-      payloadMesh.material.dispose();
-      payloadMesh = null;
-    }
-    if (!buffer) return;
-
-    const { positions, normals } = decode(buffer);
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-
-    payloadMesh = new THREE.Mesh(
-      geometry,
-      new THREE.MeshStandardMaterial({
-        color: new THREE.Color(cssVar('--payload')),
-        metalness: 0.05,
-        roughness: 0.75,
-        transparent: true,
-        opacity: 0.95,
-      }),
-    );
-    hullGroup.add(payloadMesh);
-  }
-
-  /* Remembered rather than applied once: the caller sets this while adopting a
-     run, which happens before the new mesh arrives, so setHull has to re-apply
-     it to the fresh material. */
-  function setHullTransparent(transparent) {
-    hullTransparent = Boolean(transparent);
-    applyHullTransparency();
-  }
-
   function applyHullTransparency() {
     if (!hullMesh) return;
     hullMesh.material.transparent = hullTransparent;
@@ -275,19 +252,31 @@ const viewport = (() => {
     if (hullEdges) hullEdges.material.opacity = hullTransparent ? 0.28 : 0.18;
   }
 
-  function setHull(buffer) {
+  function geometryFrom(buffer) {
     const { positions, normals } = decode(buffer);
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+    return geometry;
+  }
+
+  function disposeEntry(entry) {
+    for (const object of entry.objects) {
+      object.geometry?.dispose?.();
+      object.material?.dispose?.();
+    }
+  }
+
+  /* The payload is a child of the hull group, so it inherits exactly the same
+     placement transform. Anything else risks drawing it somewhere it is not,
+     which would make "does it fit" a lie. */
+  function build(key, hullBuffer, payloadBuffer) {
+    const geometry = geometryFrom(hullBuffer);
     geometry.computeBoundingSphere();
     geometry.computeBoundingBox();
 
-    // clear() drops every child, the payload included, so forget it too --
-    // loadPayloadMesh re-adds it right after.
-    clear(hullGroup);
-    payloadMesh = null;
-    hullMesh = new THREE.Mesh(
+    const objects = [];
+    const hull = new THREE.Mesh(
       geometry,
       new THREE.MeshStandardMaterial({
         color: new THREE.Color(cssVar('--hull')),
@@ -296,31 +285,94 @@ const viewport = (() => {
         side: THREE.DoubleSide,
       }),
     );
-    hullGroup.add(hullMesh);
+    objects.push(hull);
 
-    hullEdges = new THREE.LineSegments(
-      new THREE.EdgesGeometry(geometry, 28),
-      new THREE.LineBasicMaterial({
-        color: new THREE.Color(cssVar('--text-primary')), transparent: true, opacity: 0.18,
-      }),
-    );
-    hullGroup.add(hullEdges);
-    applyHullTransparency();
+    let edges = null;
+    if (geometry.attributes.position.count / 3 <= EDGE_TRIANGLE_LIMIT) {
+      edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(geometry, 28),
+        new THREE.LineBasicMaterial({
+          color: new THREE.Color(cssVar('--text-primary')), transparent: true, opacity: 0.18,
+        }),
+      );
+      objects.push(edges);
+    }
 
-    modelScale = Math.max(geometry.boundingSphere.radius * 2, 0.05);
-    framed = false;
-    $('view-empty').hidden = true;
+    let payload = null;
+    if (payloadBuffer) {
+      payload = new THREE.Mesh(
+        geometryFrom(payloadBuffer),
+        new THREE.MeshStandardMaterial({
+          color: new THREE.Color(cssVar('--payload')),
+          metalness: 0.05,
+          roughness: 0.75,
+          transparent: true,
+          opacity: 0.95,
+        }),
+      );
+      objects.push(payload);
+    }
+
+    const entry = {
+      objects, hull, edges, payload,
+      modelScale: Math.max(geometry.boundingSphere.radius * 2, 0.05),
+    };
+    entries.set(key, entry);
+    while (entries.size > MAX_ENTRIES) {
+      const oldest = entries.keys().next().value;
+      if (oldest === key) break;
+      disposeEntry(entries.get(oldest));
+      entries.delete(oldest);
+    }
+    return entry;
   }
 
-  function clearAll() {
-    clear(hullGroup);
-    clear(roadGroup);
-    clear(windGroup);
-    clear(dropGroup);
+  /* Detach without disposing: the objects belong to the cache, not the group. */
+  function detach() {
+    hullGroup.remove(...hullGroup.children);
     hullMesh = null;
     hullEdges = null;
     payloadMesh = null;
+  }
+
+  function show(key, transparent) {
+    const entry = entries.get(key);
+    if (!entry) return false;
+    // Re-inserting moves it to the back of the Map, so eviction stays LRU.
+    entries.delete(key);
+    entries.set(key, entry);
+
+    detach();
+    for (const object of entry.objects) hullGroup.add(object);
+    hullMesh = entry.hull;
+    hullEdges = entry.edges;
+    payloadMesh = entry.payload;
+    modelScale = entry.modelScale;
+    hullTransparent = Boolean(transparent);
+    applyHullTransparency();
+    framed = false;
+    $('view-empty').hidden = true;
+    return true;
+  }
+
+  function setRun(key, hullBuffer, payloadBuffer, transparent) {
+    if (!entries.has(key)) build(key, hullBuffer, payloadBuffer);
+    show(key, transparent);
+  }
+
+  function clearAll() {
+    detach();
+    clear(roadGroup);
+    clear(windGroup);
+    clear(dropGroup);
     $('view-empty').hidden = false;
+  }
+
+  function forget(key) {
+    const entry = entries.get(key);
+    if (!entry) return;
+    disposeEntry(entry);
+    entries.delete(key);
   }
 
   function buildRoad(size) {
@@ -473,10 +525,7 @@ const viewport = (() => {
   window.addEventListener('resize', resize);
   tick();
 
-  return {
-    setHull, setPayload, setHullTransparent, update, clearAll,
-    refit: () => { framed = false; },
-  };
+  return { setRun, show, clearAll, forget, update };
 })();
 
 /* -------------------------------------------------------------- controls */
@@ -628,7 +677,8 @@ let patchTimer = null;
 
 function pushControl(section, key, value, live = false) {
   const run = state.run;
-  if (!run || run.status === 'running') return;
+  const status = statusOf(run?.id) || run?.status;
+  if (!run || status === 'running' || status === 'queued') return;
   run.scene[section][key] = value;
   if (section === 'wind') {
     const speed = run.scene.wind.speed;
@@ -657,6 +707,7 @@ async function flushPatch() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
+    state.runCache.set(payload.id, payload);
     adoptRun(payload, { skipControls: true, keepCamera: true });
   } catch (error) {
     toast(`Update failed: ${error.message}`, true);
@@ -675,13 +726,18 @@ function renderTabs() {
     if (summary.id === state.activeId) tab.classList.add('is-active');
     if (summary.kind === 'shape') tab.classList.add('is-shape');
 
+    const position = queuePosition(summary.id);
     const glyph = el('span', 'glyph');
     if (summary.status === 'running') glyph.classList.add('glyph-running');
+    else if (summary.status === 'queued') glyph.classList.add('glyph-queued');
     else if (summary.status === 'failed') glyph.classList.add('glyph-failed');
     else if (summary.status === 'draft') glyph.classList.add('glyph-draft');
     else glyph.classList.add(summary.kind === 'shape' ? 'glyph-shape' : 'glyph-drag');
+    if (position) glyph.title = `${position} in the queue`;
 
     tab.append(glyph, el('span', 'tab-label', summary.title));
+
+    if (position) tab.append(el('span', 'tab-queue', `#${position}`));
 
     if (summary.changed_count) {
       const dot = el('i', 'changed-dot');
@@ -690,7 +746,7 @@ function renderTabs() {
     }
 
     const close = el('span', 'tab-close', '×');
-    close.title = 'Close this run';
+    close.title = summary.status === 'queued' ? 'Cancel and close this run' : 'Close this run';
     close.addEventListener('click', async (event) => {
       event.stopPropagation();
       await closeRun(summary.id);
@@ -700,7 +756,7 @@ function renderTabs() {
     // A solving run reports progress from every tab, not just its own.
     if (summary.status === 'running') {
       const bar = el('span', 'tab-progress');
-      const fraction = state.job?.progress?.fraction;
+      const fraction = state.running?.progress?.fraction;
       bar.style.width = `${Math.round((fraction ?? 0.04) * 100)}%`;
       tab.append(bar);
     }
@@ -720,9 +776,11 @@ function renderTabs() {
   const busy = state.runs.find((item) => item.status === 'running');
   if (busy) {
     note.append(el('span', 'glyph glyph-running'));
-    const remaining = state.job?.progress?.remaining_text;
+    const remaining = state.running?.progress?.remaining_text;
+    const waiting = state.queue.length;
     note.append(document.createTextNode(
-      `${busy.title} solving${remaining ? ` · ~${remaining} left` : ''}`,
+      `${busy.title} solving${remaining ? ` · ~${remaining} left` : ''}`
+      + (waiting ? ` · ${waiting} queued` : ''),
     ));
   } else if (state.runs.length) {
     note.textContent = `${state.runs.length} run${state.runs.length === 1 ? '' : 's'} open`;
@@ -1543,16 +1601,32 @@ function renderAsRun() {
 
 function renderProgress() {
   const run = state.run;
-  const running = run?.status === 'running';
-  $('progress-block').hidden = !running;
-  $('error-block').hidden = run?.status !== 'failed';
+  const status = statusOf(run?.id) || run?.status;
+  const active = status === 'running' || status === 'queued';
+  $('progress-block').hidden = !active;
+  $('error-block').hidden = status !== 'failed';
 
-  if (run?.status === 'failed') $('error-text').textContent = run.error || 'The run failed.';
-  if (!running) return;
+  if (status === 'failed') $('error-text').textContent = run.error || 'The run failed.';
+  if (!active) return;
 
-  const job = state.job && state.job.run_id === run.id ? state.job : null;
   const line = $('eta-line');
   line.textContent = '';
+  $('run-log').textContent = '';
+
+  if (status === 'queued') {
+    const position = queuePosition(run.id);
+    $('progress-fill').style.width = '0%';
+    line.append(el('strong', null, position ? `${position} in the queue` : 'queued'));
+    const ahead = state.running
+      ? state.runs.find((item) => item.id === state.running.run_id)?.title
+      : null;
+    line.append(document.createTextNode(
+      ahead ? ` · waiting on ${ahead}` : ' · waiting for the solver',
+    ));
+    return;
+  }
+
+  const job = state.running && state.running.run_id === run.id ? state.running : null;
   const progress = job?.progress;
   if (progress) {
     $('progress-fill').style.width = `${Math.round(progress.fraction * 100)}%`;
@@ -1589,40 +1663,43 @@ function renderActions() {
   eta.textContent = '';
   if (!run) return;
 
-  const busyElsewhere = Boolean(state.runningId && state.runningId !== run.id);
-  const isRunning = run.status === 'running';
+  const status = statusOf(run.id) || run.status;
+  const isRunning = status === 'running';
+  const isQueued = status === 'queued';
+  const committed = isRunning || isQueued;
   const isShape = run.kind === 'shape';
   const noBackends = (run.scene.solver.backends || []).length === 0;
 
   compute.textContent = isRunning
     ? 'Solving…'
-    : isShape ? 'Compute drag on the shell' : 'Compute drag';
+    : isQueued ? 'Queued' : isShape ? 'Compute drag on the shell' : 'Compute drag';
   derive.textContent = isRunning && isShape
     ? 'Building…'
-    : isShape ? 'Derive again' : 'Derive a lower-drag shape';
+    : isQueued && isShape ? 'Queued' : isShape ? 'Derive again' : 'Derive a lower-drag shape';
 
-  compute.disabled = isRunning || busyElsewhere || noBackends || (isShape && !run.shell);
-  derive.disabled = isRunning || busyElsewhere;
+  // Only *this* run being committed blocks its own buttons. Another run on the
+  // solver does not: pressing compute simply joins the queue.
+  compute.disabled = committed || noBackends || (isShape && !run.shell);
+  derive.disabled = committed;
 
-  // A blocked button says why it is blocked; that reason outranks whatever the
-  // button would otherwise have explained about itself.
   const blocked = isRunning
-    ? 'This run is working. Its parameters are frozen; every other tab stays live.'
-    : busyElsewhere
-      ? `One solve at a time — ${
-        state.runs.find((item) => item.id === state.runningId)?.title || 'another run'
-      } is running. Reading and editing this run is unaffected.`
+    ? 'This run is on the solver. Its parameters are frozen; every other tab stays live.'
+    : isQueued
+      ? `Waiting its turn${queuePosition(run.id) ? ` (${queuePosition(run.id)} in the queue)` : ''}. `
+        + 'Its parameters are frozen so what runs is what you see.'
       : null;
 
   if (blocked) {
     computeWhy.textContent = blocked;
     deriveWhy.textContent = blocked;
   } else {
+    const ahead = state.queue.length + (state.running ? 1 : 0);
+    const queueNote = ahead ? ` Queues behind ${ahead} run${ahead === 1 ? '' : 's'}.` : '';
     if (noBackends) {
       computeWhy.textContent = 'Tick at least one solver above.';
     } else if (isShape) {
       computeWhy.textContent = run.shell
-        ? 'Opens the shell as its own run and solves it. This run stays as it is.'
+        ? `Opens the shell as its own run and solves it. This run stays as it is.${queueNote}`
         : 'Build the shell first.';
     } else if (run.results?.runs?.length) {
       computeWhy.append(document.createTextNode('Opens a new run carrying '));
@@ -1630,18 +1707,26 @@ function renderActions() {
         run.changed?.length
           ? `your ${run.changed.length} changed parameter${run.changed.length === 1 ? '' : 's'}`
           : 'the same parameters'));
-      computeWhy.append(document.createTextNode('. This one is kept.'));
+      computeWhy.append(document.createTextNode(`. This one is kept.${queueNote}`));
     } else {
-      computeWhy.textContent = 'Solves into this run — it has no results to overwrite yet.';
+      computeWhy.textContent =
+        `Solves into this run — it has no results to overwrite yet.${queueNote}`;
     }
 
-    deriveWhy.textContent = isShape
+    deriveWhy.textContent = (isShape
       ? 'Re-wraps the same payload with these settings, as a new run.'
-      : 'Wraps this shape in one closed shell, as a new run. This one is kept.';
+      : 'Wraps this shape in one closed shell, as a new run. This one is kept.') + queueNote;
   }
 
-  if (isRunning) {
-    const job = state.job && state.job.run_id === run.id ? state.job : null;
+  if (isQueued) {
+    eta.append(el('span', 'glyph glyph-queued'));
+    eta.append(el('strong', null, `${queuePosition(run.id) || '?'} in the queue`));
+    const cancel = el('button', 'link-button', 'cancel');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => cancelRun(run.id));
+    eta.append(cancel);
+  } else if (isRunning) {
+    const job = state.running && state.running.run_id === run.id ? state.running : null;
     eta.append(el('span', 'glyph glyph-running'));
     if (job?.progress) {
       eta.append(el('strong', null, `~${job.progress.remaining_text} left`));
@@ -1698,37 +1783,44 @@ function renderLegend() {
   }
 }
 
-/* The mesh only travels when it actually changed: switching tabs, adopting a
-   shell, or a shape run finishing. Everything else is a transform the browser
-   applies itself. */
+/* The mesh only travels when it actually changed: a new run, a shell adopted,
+   a shape run finishing. Everything else is a transform the browser applies
+   itself, and a tab already visited is still in the viewport's cache. */
 function meshKeyFor(run) {
   if (!run) return null;
-  return [run.id, run.scene.geometry.source_name, run.shell_source || '', run.status].join('|');
+  return [
+    run.id, run.scene.geometry.source_name, run.shell_source || '',
+    run.show_payload ? 'p' : '-', run.status,
+  ].join('|');
 }
 
-async function loadMeshes(force = false) {
-  const run = state.run;
+async function loadMeshes(run, force = false) {
   if (!run) { viewport.clearAll(); state.meshKey = null; return; }
 
   const key = meshKeyFor(run);
-  if (!force && key === state.meshKey) return;
+  if (force) viewport.forget(key);
+
+  if (!force && key === state.meshKey) { viewport.update(run.scene); return; }
+
+  // Already built for this run: swapping it back in costs nothing.
+  if (!force && viewport.show(key, run.show_payload)) {
+    state.meshKey = key;
+    viewport.update(run.scene);
+    return;
+  }
 
   try {
-    const response = await api(`/api/runs/${run.id}/mesh`);
-    viewport.setHull(await response.arrayBuffer());
-    viewport.setHullTransparent(Boolean(run.show_payload));
-    viewport.refit();
-
-    if (run.show_payload) {
-      try {
-        const payload = await api(`/api/runs/${run.id}/payload-mesh`);
-        viewport.setPayload(await payload.arrayBuffer());
-      } catch (error) { viewport.setPayload(null); }
-    } else {
-      viewport.setPayload(null);
-    }
-    viewport.update(run.scene);
+    const [hull, payload] = await Promise.all([
+      api(`/api/runs/${run.id}/mesh`).then((r) => r.arrayBuffer()),
+      run.show_payload
+        ? api(`/api/runs/${run.id}/payload-mesh`).then((r) => r.arrayBuffer()).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+    // The user may have moved on while those were in flight.
+    if (state.activeId !== run.id) return;
+    viewport.setRun(key, hull, payload, run.show_payload);
     state.meshKey = key;
+    viewport.update(run.scene);
   } catch (error) {
     toast(`Could not load the shape: ${error.message}`, true);
   }
@@ -1759,7 +1851,17 @@ function render() {
   // settable *before* deriving, and a shape run's solver settings are the ones
   // its shell inherits when it is opened as a run.
   for (const block of document.querySelectorAll('.param-block')) block.hidden = !run;
-  $('freeze-block').hidden = run?.status !== 'running';
+
+  const runStatus = statusOf(run?.id) || run?.status;
+  const frozen = runStatus === 'running' || runStatus === 'queued';
+  $('freeze-block').hidden = !frozen;
+  if (frozen) {
+    $('freeze-note').textContent = runStatus === 'running'
+      ? 'Parameters are frozen until this run finishes — what you see is what the '
+        + 'solver was given. Open another tab to keep working.'
+      : 'Parameters are frozen from the moment this run joined the queue, so what '
+        + 'gets solved is what you see. Cancel it to edit them again.';
+  }
   $('empty-results').hidden = Boolean(
     !run || run.status === 'running' || run.status === 'failed'
     || (run.kind === 'drag' && run.results?.runs?.length)
@@ -1773,7 +1875,7 @@ function render() {
 
   $('btn-download').disabled = !run;
   $('btn-download-stl').disabled = !run;
-  lockControls(run ? run.status === 'running' : true);
+  lockControls(!run || frozen);
 }
 
 function adoptRun(payload, options = {}) {
@@ -1784,18 +1886,32 @@ function adoptRun(payload, options = {}) {
     $('quality-select').value = payload.scene.solver.quality || 'balanced';
   }
   markChangedControls(payload.changed);
-  if (payload.job) state.job = payload.job;
   render();
   if (!options.keepCamera) viewport.update(payload.scene);
 }
 
 function adoptState(payload) {
-  state.runs = payload.runs || [];
-  state.solvers = payload.solvers || [];
-  state.cores = payload.cores || null;
-  state.runningId = payload.running_id || null;
-  state.runningJob = payload.running_job || null;
+  if (!payload) return;
+  // A run whose status moved has new results, a new shape or a new freeze, so
+  // whatever is cached for it is stale.
+  const before = new Map(state.runs.map((item) => [item.id, item.status]));
+  state.runs = payload.runs || state.runs;
+  for (const item of state.runs) {
+    if (before.has(item.id) && before.get(item.id) !== item.status) state.runCache.delete(item.id);
+  }
+  if (payload.solvers) state.solvers = payload.solvers;
+  if (payload.cores) state.cores = payload.cores;
+  state.running = payload.running ?? null;
+  state.queue = payload.queue || [];
   if (payload.active_id) state.activeId = payload.active_id;
+}
+
+function statusOf(runId) {
+  return state.runs.find((item) => item.id === runId)?.status;
+}
+
+function queuePosition(runId) {
+  return state.queue.find((item) => item.run_id === runId)?.position ?? null;
 }
 
 /* -------------------------------------------------------------- actions */
@@ -1809,89 +1925,106 @@ async function selectRun(runId, options = {}) {
   if (!runId) {
     state.run = null;
     state.activeId = null;
+    state.meshKey = null;
     viewport.clearAll();
     render();
     return;
   }
-  try {
-    const payload = await api(`/api/runs/${runId}`);
-    await api(`/api/runs/${runId}/activate`, { method: 'POST' });
-    state.activeId = runId;
-    adoptRun(payload);
-    await loadMeshes(options.forceMesh);
-    watchRunningJob();
-  } catch (error) {
-    toast(error.message, true);
+
+  state.activeId = runId;
+
+  // Paint from the cache first so the tab switch is immediate, then revalidate.
+  const cached = options.force ? null : state.runCache.get(runId);
+  if (cached) {
+    adoptRun(cached, options);
+    await loadMeshes(cached);
   }
+
+  // Which tab is active only matters to a page reload, so it need not be
+  // waited on -- and waiting on it was a third round trip per switch.
+  api(`/api/runs/${runId}/activate`, { method: 'POST' }).catch(() => {});
+
+  try {
+    const fresh = await api(`/api/runs/${runId}`);
+    state.runCache.set(runId, fresh);
+    if (state.activeId !== runId) return;  // moved on while this was in flight
+    adoptRun(fresh, cached ? { ...options, keepCamera: true } : options);
+    await loadMeshes(fresh, options.forceMesh);
+  } catch (error) {
+    if (!cached) toast(error.message, true);
+  }
+  schedulePoll();
 }
 
 async function openRun(payload) {
   adoptState(payload.state);
+  state.runCache.set(payload.run.id, payload.run);
+  state.activeId = payload.run.id;
   adoptRun(payload.run);
-  await loadMeshes();
-  render();
+  await loadMeshes(payload.run);
+  schedulePoll();
 }
 
 async function closeRun(runId) {
   try {
     const payload = await api(`/api/runs/${runId}`, { method: 'DELETE' });
+    state.runCache.delete(runId);
     adoptState(payload);
-    if (payload.active_id) await selectRun(payload.active_id);
-    else await selectRun(null);
+    await selectRun(payload.active_id || null);
   } catch (error) { toast(error.message, true); }
 }
 
-/* One poll loop for whichever run is solving, so the tab bar keeps its
-   progress bar moving while you read a different run. The guard matters:
-   switching tabs calls this, and a second loop started while the first is
-   mid-fetch would double the polling rate for the rest of the solve. */
-function watchRunningJob() {
-  if (!state.runningJob || state.polling) return;
-  clearTimeout(state.jobTimer);
-  state.jobTimer = setTimeout(pollJob, 400);
+async function cancelRun(runId) {
+  try {
+    const payload = await api(`/api/runs/${runId}/cancel`, { method: 'POST' });
+    state.runCache.set(runId, payload.run);
+    adoptState(payload.state);
+    if (runId === state.activeId) adoptRun(payload.run, { keepCamera: true });
+    render();
+    toast('Taken out of the queue');
+  } catch (error) { toast(error.message, true); }
 }
 
-async function pollJob() {
-  clearTimeout(state.jobTimer);
-  const jobId = state.runningJob;
-  if (!jobId) return;
+/* One poll for everything in flight: run states, queue positions and the
+   running job's progress arrive together, so the tab bar and the panel can
+   never disagree. It stops as soon as the queue empties. */
+function schedulePoll(delay = 500) {
+  if (state.polling) return;
+  if (!state.running && !state.queue.length) return;
+  clearTimeout(state.pollTimer);
+  state.pollTimer = setTimeout(pollActivity, delay);
+}
 
+async function pollActivity() {
+  clearTimeout(state.pollTimer);
+  if (state.polling) return;
   state.polling = true;
+
+  const wasActive = statusOf(state.activeId);
   try {
-    const job = await api(`/api/jobs/${jobId}`);
-    state.job = job;
+    adoptState(await api('/api/activity'));
+    const nowActive = statusOf(state.activeId);
 
-    if (job.status === 'running') {
-      renderTabs();
-      if (job.run_id === state.activeId) { renderProgress(); renderActions(); }
+    if (wasActive !== nowActive && (nowActive === 'done' || nowActive === 'failed')) {
+      state.runCache.delete(state.activeId);
       state.polling = false;
-      state.jobTimer = setTimeout(pollJob, 900);
-      return;
-    }
-
-    state.polling = false;
-    state.runningJob = null;
-    if (job.state) adoptState(job.state);
-    if (job.status === 'failed') {
-      toast(job.error || 'The run failed', true);
+      await selectRun(state.activeId, { keepCamera: true });
+      const run = state.run;
+      if (nowActive === 'failed') toast(run?.error || 'The run failed', true);
+      else toast(run?.kind === 'shape' ? 'Shell ready' : 'Run complete');
     } else {
-      toast(job.kind === 'shape' ? 'Shell ready' : 'Run complete');
+      renderTabs();
+      renderProgress();
+      renderActions();
     }
-
-    if (job.run && job.run.id === state.activeId) {
-      adoptRun(job.run);
-      await loadMeshes();
-    } else {
-      await refreshState();
-    }
-    render();
   } catch (error) {
-    toast(`Lost the run: ${error.message}`, true);
+    toast(`Lost track of the queue: ${error.message}`, true);
+    state.running = null;
+    state.queue = [];
+  } finally {
     state.polling = false;
-    state.runningJob = null;
-    state.job = null;
-    render();
   }
+  schedulePoll(900);
 }
 
 async function startCompute() {
@@ -1913,9 +2046,10 @@ async function startCompute() {
       body: JSON.stringify({ backends: run.scene.solver.backends }),
     });
     adoptState(payload.state);
-    state.runningJob = payload.job.id;
-    state.job = payload.job;
-    if (payload.forked) toast(`Solving as a new run: ${payload.run.title}`);
+    state.runCache.set(payload.run.id, payload.run);
+    const position = payload.job.position;
+    if (payload.forked) toast(`New run: ${payload.run.title}${position ? ` · ${position} in the queue` : ''}`);
+    else if (position) toast(`${position} in the queue`);
     await selectRun(payload.run_id);
   } catch (error) {
     toast(error.message, true);
@@ -1928,9 +2062,11 @@ async function startDerive() {
   try {
     const payload = await api(`/api/runs/${run.id}/derive`, { method: 'POST' });
     adoptState(payload.state);
-    state.runningJob = payload.job.id;
-    state.job = payload.job;
-    toast('Searching for the smallest single-body shell');
+    state.runCache.set(payload.run.id, payload.run);
+    const position = payload.job.position;
+    toast(position
+      ? `Shape search queued · ${position} in the queue`
+      : 'Searching for the smallest single-body shell');
     await selectRun(payload.run_id);
   } catch (error) {
     toast(error.message, true);
@@ -2145,7 +2281,7 @@ async function boot() {
     await refreshState();
     if (state.activeId) await selectRun(state.activeId);
     else render();
-    watchRunningJob();
+    schedulePoll();
   } catch (error) {
     toast(`Could not reach the server: ${error.message}`, true);
   }

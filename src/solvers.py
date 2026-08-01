@@ -388,7 +388,7 @@ def run_scene(
 
     # Plan the run before starting it, so the user is told what they are in
     # for rather than watching an indeterminate spinner.
-    forecast = estimates.estimate_scene(scene, backend_list)
+    forecast = estimates.estimate_scene(scene, backend_list, mode=mode)
     plan: list[tuple[str, float]] = []
     for backend in backend_list:
         entry = forecast["per_backend"].get(backend, {})

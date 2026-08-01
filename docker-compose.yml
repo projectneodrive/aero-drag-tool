@@ -1,0 +1,60 @@
+# The whole stack, pulling the published images from GHCR.
+#
+#   docker compose --profile solvers pull    # all three images, no compile
+#   docker compose up web                    # then open http://127.0.0.1:8000
+#
+# The images are built and pushed by .github/workflows/containers.yml on
+# every release tag. To build them locally instead -- unreleased changes, or
+# no registry access -- use the twin file:
+#
+#   docker compose -f docker-compose-local.yml --profile solvers build
+#
+# Only `web` is a service. The solver images are batch runners the backend
+# launches per solver command (`docker run --rm ... bash -lc`, see
+# src/execution.py); their CMD is bash, so under `up` they would start, read
+# EOF and exit. The `solvers` profile keeps them out of `up` while still
+# giving `pull` something to pre-fetch -- the backend reports a solver as
+# available only when its image is already present.
+
+services:
+  web:
+    image: ghcr.io/projectneodrive/aero-drag-tool/web:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # Sibling containers through the host daemon, not docker-in-docker.
+      AERO_EXECUTION: docker
+      # The backend launches the solvers by name; without these it would look
+      # for the locally built tags rather than the published images.
+      AERO_OPENFOAM_IMAGE: ghcr.io/projectneodrive/aero-drag-tool/openfoam:13
+      AERO_SU2_IMAGE: ghcr.io/projectneodrive/aero-drag-tool/su2:8.4.0
+      # Case directories come from tempfile.mkdtemp, which honours TMPDIR, so
+      # every case lands under the one path that is identity-mounted below.
+      TMPDIR: /tmp/aero-cases
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Identity mount, same path inside and out, and it has to be: the
+      # backend bind-mounts a case directory into each solver container by
+      # the path *it* sees, and the daemon resolves that path on its own
+      # filesystem. Identical paths make both views the same directory. On
+      # Docker Desktop this path lives inside the VM, which is exactly where
+      # the README says case directories belong -- snappyHexMesh's small-file
+      # storm never crosses the 9p boundary to C:\.
+      - /tmp/aero-cases:/tmp/aero-cases
+      # The scene library and the self-calibrating runtime estimates, so both
+      # survive the container. runtime_history.json is rewritten in place
+      # (never replaced), so a single-file bind holds.
+      - ./scenes:/app/scenes
+      - ./runtime_history.json:/app/runtime_history.json
+    # Uncomment to cap the solve. available_cores() reads the cgroup quota,
+    # the 80% default follows it, and the mpirun rank count is computed here
+    # before the solver container is launched -- so capping `web` caps them.
+    # cpus: "8"
+
+  openfoam:
+    profiles: ["solvers"]
+    image: ghcr.io/projectneodrive/aero-drag-tool/openfoam:13
+
+  su2:
+    profiles: ["solvers"]
+    image: ghcr.io/projectneodrive/aero-drag-tool/su2:8.4.0

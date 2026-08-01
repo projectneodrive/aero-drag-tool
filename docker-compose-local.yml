@@ -1,0 +1,69 @@
+# The whole stack, built locally instead of pulled from GHCR.
+#
+#   docker compose -f docker-compose-local.yml --profile solvers build
+#   docker compose -f docker-compose-local.yml up web
+#
+# For released versions there is nothing to compile: the default
+# docker-compose.yml pulls the images the release workflow published, and
+# skipping the SU2 source build is the whole reason it exists. This file is
+# for working on unreleased changes, or for machines without registry access.
+#
+# The image tags here are the defaults baked into src/execution.py
+# (OPENFOAM_IMAGE, SU2_IMAGE), the same contract docker/build.sh follows --
+# which is why, unlike the pull variant, no AERO_*_IMAGE override is needed.
+#
+# Only `web` is a service. The solver images are batch runners the backend
+# launches per solver command (`docker run --rm ... bash -lc`, see
+# src/execution.py); their CMD is bash, so under `up` they would start, read
+# EOF and exit. The `solvers` profile keeps them out of `up` while still
+# letting compose build and tag them.
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    image: aero-drag-tool/web:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # Sibling containers through the host daemon, not docker-in-docker.
+      AERO_EXECUTION: docker
+      # Case directories come from tempfile.mkdtemp, which honours TMPDIR, so
+      # every case lands under the one path that is identity-mounted below.
+      TMPDIR: /tmp/aero-cases
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Identity mount, same path inside and out, and it has to be: the
+      # backend bind-mounts a case directory into each solver container by
+      # the path *it* sees, and the daemon resolves that path on its own
+      # filesystem. Identical paths make both views the same directory. On
+      # Docker Desktop this path lives inside the VM, which is exactly where
+      # the README says case directories belong -- snappyHexMesh's small-file
+      # storm never crosses the 9p boundary to C:\.
+      - /tmp/aero-cases:/tmp/aero-cases
+      # The scene library and the self-calibrating runtime estimates, so both
+      # survive the container. runtime_history.json is rewritten in place
+      # (never replaced), so a single-file bind holds.
+      - ./scenes:/app/scenes
+      - ./runtime_history.json:/app/runtime_history.json
+    # Uncomment to cap the solve. available_cores() reads the cgroup quota,
+    # the 80% default follows it, and the mpirun rank count is computed here
+    # before the solver container is launched -- so capping `web` caps them.
+    # cpus: "8"
+
+  # Build context is docker/ alone: the solver images copy nothing from the
+  # repo.
+  openfoam:
+    profiles: ["solvers"]
+    image: aero-drag-tool/openfoam:13
+    build:
+      context: docker
+      dockerfile: Dockerfile.openfoam
+
+  su2:
+    profiles: ["solvers"]
+    image: aero-drag-tool/su2:8.4.0
+    build:
+      context: docker
+      dockerfile: Dockerfile.su2

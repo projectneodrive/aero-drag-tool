@@ -1,0 +1,64 @@
+# The GUI: the FastAPI backend (src/server.py) and the browser front end it
+# serves out of src/web. One image for both, because the front end is static
+# files with no build step -- three.js is vendored in the repo -- so there is
+# no node stage to separate.
+#
+# No solver is installed here. The backend runs with AERO_EXECUTION=docker and
+# launches the pinned solver images as *sibling* containers through the host
+# daemon's socket -- not docker-in-docker. That is why the docker CLI is
+# installed but no daemon, and why docker-compose.yml mounts
+# /var/run/docker.sock into this container.
+#
+# Meshing stays in this image: gmsh builds the SU2 volume mesh here (only the
+# solve happens in the SU2 container), and the fairing pipeline is pure Python.
+
+FROM python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# The gmsh wheel links against X11 and OpenGL shared libraries even when it is
+# only ever driven headless through the SDK; without them `import gmsh` fails
+# at dlopen. libgomp1 is its OpenMP runtime. The docker CLI comes from
+# Docker's own apt repository because Debian's docker.io package drags the
+# daemon in with it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libgl1 \
+        libglu1-mesa \
+        libgomp1 \
+        libxcursor1 \
+        libxft2 \
+        libxinerama1 \
+        libxrender1 \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \
+        -o /etc/apt/keyrings/docker.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# server.py resolves everything relative to itself: the front end at src/web,
+# the samples and scenes/ at the project root. /app reproduces that layout, so
+# the project root is /app.
+COPY src/ src/
+COPY sample.stl sample2.stl ./
+
+# Pin the mode instead of letting the probe decide. The probe would land on
+# docker anyway -- no solver is on PATH here -- but only after paying for the
+# lookups, and an unexpected foamRun on PATH should not silently win.
+ENV AERO_EXECUTION=docker \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+# 0.0.0.0 because the default 127.0.0.1 is unreachable from outside the
+# container; --no-browser because webbrowser.open has nothing to open in here.
+CMD ["python", "src/server.py", "--host", "0.0.0.0", "--no-browser"]
