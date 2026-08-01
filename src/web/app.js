@@ -43,6 +43,13 @@ const CONTROL_SPECS = {
     { key: 'viscosity', label: 'Viscosity', unit: 'Pa·s', type: 'number', expo: true },
   ],
   packaging: [
+    {
+      key: 'shape_solver', label: 'Shape solver', type: 'select',
+      options: [
+        ['heuristic', 'Heuristic — taper rules, seconds'],
+        ['cfd', 'True loop — CFD in the loop, slow'],
+      ],
+    },
     { key: 'clearance', label: 'Payload clearance', unit: 'm', min: 0.005, max: 0.3, step: 0.005, decimals: 3 },
     { key: 'anisotropy', label: 'Streamwise bias', min: 1, max: 6, step: 0.1, decimals: 1 },
     { key: 'resolution', label: 'Voxel resolution', min: 48, max: 220, step: 4, decimals: 0 },
@@ -1499,6 +1506,19 @@ function renderShell() {
   fit.classList.add('tile-span');
   host.append(fit);
 
+  if (shell.refinement) {
+    const ref = shell.refinement;
+    const gain = (ref.improvement === null || ref.improvement === undefined)
+      ? null : ref.improvement * 100;
+    const refined = tile('True loop',
+      `tail ${fmt(ref.best.tail_deg, 1)}° · nose ${fmt(ref.best.nose_deg, 1)}°`,
+      null,
+      `measured over ${ref.solves} ${ref.backend} solves`
+        + (gain === null ? '' : ` · Cd·A ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% vs the heuristic angles`));
+    refined.classList.add('tile-span');
+    host.append(refined);
+  }
+
   const note = $('sweep-note');
   if (shell.merge_radius === null || shell.merge_radius === undefined) {
     note.textContent = 'The payload never merged within the grid, so the shell was built at the largest radius available.';
@@ -1673,9 +1693,12 @@ function renderActions() {
   compute.textContent = isRunning
     ? 'Solving…'
     : isQueued ? 'Queued' : isShape ? 'Compute drag on the shell' : 'Compute drag';
+  const cfdLoop = run.scene.packaging?.shape_solver === 'cfd';
   derive.textContent = isRunning && isShape
-    ? 'Building…'
-    : isQueued && isShape ? 'Queued' : isShape ? 'Derive again' : 'Derive a lower-drag shape';
+    ? (cfdLoop ? 'Refining…' : 'Building…')
+    : isQueued && isShape ? 'Queued'
+      : isShape ? (cfdLoop ? 'Derive again + refine' : 'Derive again')
+        : (cfdLoop ? 'Derive + refine with CFD' : 'Derive a lower-drag shape');
 
   // Only *this* run being committed blocks its own buttons. Another run on the
   // solver does not: pressing compute simply joins the queue.
@@ -1713,9 +1736,14 @@ function renderActions() {
         `Solves into this run — it has no results to overwrite yet.${queueNote}`;
     }
 
+    const loopNote = cfdLoop
+      ? ` Then flies ~${run.scene.packaging?.refine_solves || 10} screening solves to tune the`
+        + ' tail and nose angles — minutes to an hour, watchable in the log.'
+      : '';
     deriveWhy.textContent = (isShape
       ? 'Re-wraps the same payload with these settings, as a new run.'
-      : 'Wraps this shape in one closed shell, as a new run. This one is kept.') + queueNote;
+      : 'Wraps this shape in one closed shell, as a new run. This one is kept.')
+      + loopNote + queueNote;
   }
 
   if (isQueued) {
@@ -2073,16 +2101,6 @@ async function startDerive() {
   }
 }
 
-async function adoptShell() {
-  const run = state.run;
-  if (!run) return;
-  try {
-    const payload = await api(`/api/runs/${run.id}/adopt`, { method: 'POST' });
-    await openRun(payload);
-    toast(`Opened ${payload.run.title} — compute its drag to cost the shape`);
-  } catch (error) { toast(error.message, true); }
-}
-
 /* -------------------------------------------------------------- library */
 
 async function refreshLibrary() {
@@ -2167,7 +2185,6 @@ function wire() {
 
   $('btn-compute').addEventListener('click', startCompute);
   $('btn-derive').addEventListener('click', startDerive);
-  $('btn-adopt').addEventListener('click', adoptShell);
 
   $('quality-select').addEventListener('change', async (event) => {
     if (!state.run) return;

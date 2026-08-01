@@ -100,6 +100,9 @@
         The shell is always <strong>one closed body</strong>. The sweep finds the
         smallest closing radius that merges the payload into a single lump and
         builds there — separate pods would leave a choked channel between them.
+        The <strong>heuristic</strong> solver shapes it by taper rules in seconds;
+        the <strong>true loop</strong> then flies candidate shells with the CFD
+        solver to measure the tail and nose angles this payload actually wants.
       </p>
 
       <div class="action">
@@ -193,7 +196,6 @@
       <div class="sweep-wrap"><canvas id="sweep-chart"></canvas></div>
       <p class="hint" id="sweep-note"></p>
 
-      <button id="btn-adopt" class="btn btn-primary btn-wide">Open this shell as a run &rarr;</button>
       <div id="shell-warnings" class="warnings"></div>
     </section>
 

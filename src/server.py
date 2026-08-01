@@ -785,6 +785,12 @@ def derive_shape(run_id: str) -> dict:
     packaging knobs now say, rather than wrapping the shell it already built.
     Wrapping a shell in a shell is never what "derive again" means, and it
     would quietly compound the clearance on every pass.
+
+    With the shape solver set to "cfd", the heuristic shell is only the
+    starting point: the job then flies candidate shells at screening quality
+    and walks the tail and nose angles to whatever this payload actually
+    wants. That needs a working CFD backend, which is checked *here* rather
+    than discovered by the queued job half an hour into the wait.
     """
     parent = require_run(run_id)
 
@@ -797,6 +803,30 @@ def derive_shape(run_id: str) -> dict:
     scene.payload = payload_geometry
     scene.fairing = None
 
+    # The true loop flies real candidates, so it needs a live backend. Resolve
+    # it now: a 409 at click time beats a failed job at the front of the queue.
+    refine_backend: str | None = None
+    if scene.packaging.shape_solver == "cfd":
+        if not scene.packaging.streamline:
+            raise HTTPException(
+                status_code=409,
+                detail="The true loop tunes the streamlined envelope's angles; "
+                "switch the streamlined envelope on first.",
+            )
+        available = {
+            info["name"] for info in solver_infos(scene.solver.processes) if info["available"]
+        }
+        refine_backend = next(
+            (name for name in scene.solver.backends if name in available), None
+        )
+        if refine_backend is None:
+            raise HTTPException(
+                status_code=409,
+                detail="The true loop needs a working CFD backend, and none of the "
+                "selected solvers is available here. Use the heuristic shape solver, "
+                "or install a backend.",
+            )
+
     base = base_name(parent.title)
     index, title = store.title_for(base, "shape")
     run = store.add(
@@ -805,7 +835,12 @@ def derive_shape(run_id: str) -> dict:
             kind="shape",
             index=index,
             title=title,
-            description=f"Single-body fairing around {parent.title}.",
+            description=(
+                f"Single-body fairing around {parent.title}, refined with "
+                f"{refine_backend} in the loop."
+                if refine_backend
+                else f"Single-body fairing around {parent.title}."
+            ),
             parent_id=parent.id,
             parent_label=parent.title,
             origin="derived",
@@ -871,6 +906,23 @@ def derive_shape(run_id: str) -> dict:
                 streamline=streamline,
             )
 
+            refinement = None
+            if refine_backend is not None:
+                import shapeopt
+
+                refinement = shapeopt.refine_envelope(
+                    scene,
+                    payload_mesh,
+                    coarse,
+                    sweep,
+                    refine_backend,
+                    direction,
+                    baseline_shell=shell,
+                    max_solves=packaging.refine_solves,
+                    progress=job.add_event,
+                )
+                shell = refinement.shell
+
             warnings = list(coarse.warnings) + list(fine.warnings)
             if shell.bodies > 1:
                 warnings.append(
@@ -892,7 +944,10 @@ def derive_shape(run_id: str) -> dict:
             run.shell_geometry = Geometry.from_bytes(
                 shell.mesh.export(file_type="stl"), source_name=f"{base}_shell.stl"
             )
-            run.shell = shell.to_dict()
+            shell_record = shell.to_dict()
+            if refinement is not None:
+                shell_record["refinement"] = refinement.to_dict()
+            run.shell = shell_record
             run.sweep = sweep.to_dict()
             run.shell_warnings = warnings
             run.scene.fairing = FairingSpec(
@@ -905,17 +960,34 @@ def derive_shape(run_id: str) -> dict:
                 nose_angle_deg=shell.nose_angle_deg,
                 tail_angle_deg=shell.tail_angle_deg,
             )
+            # The loop measured the angles rather than assuming them; write
+            # what it found back into the run's own knobs, so deriving again
+            # or hand-tweaking starts from the measured optimum. The as-run
+            # snapshot moves with them: the final shell really was built at
+            # these angles, and leaving the enqueue-time values there would
+            # flag the run as edited when nobody touched it.
+            if refinement is not None:
+                run.scene.packaging.nose_angle_deg = refinement.best.nose_deg
+                run.scene.packaging.tail_angle_deg = refinement.best.tail_deg
+                if run.solved_params is not None:
+                    run.solved_params["packaging.nose_angle_deg"] = refinement.best.nose_deg
+                    run.solved_params["packaging.tail_angle_deg"] = refinement.best.tail_deg
             run.status = "done"
             run.solved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             run.duration_s = time.time() - started
             job.status = "done"
-            job.add_event(
-                {
-                    "phase": "done",
-                    "message": f"Shell ready: r = {shell.radius * 1000:.0f} mm, "
-                    f"frontal area {shell.frontal_area:.4f} m²",
-                }
+            done_message = (
+                f"Shell ready: r = {shell.radius * 1000:.0f} mm, "
+                f"frontal area {shell.frontal_area:.4f} m²"
             )
+            if refinement is not None:
+                gain = refinement.improvement
+                done_message += (
+                    f" · refined to tail {refinement.best.tail_deg:.1f}°, "
+                    f"nose {refinement.best.nose_deg:.1f}° over {refinement.solves} solves"
+                    + (f" ({gain * 100:+.1f}% Cd·A)" if gain is not None else "")
+                )
+            job.add_event({"phase": "done", "message": done_message})
         except Exception as error:
             run.status = "failed"
             run.error = f"{type(error).__name__}: {error}"

@@ -77,6 +77,7 @@ TRACKED_PACKAGING: tuple[tuple[str, str, str, str | None, int | None], ...] = (
     ("packaging", "streamline", "Streamlined envelope", None, None),
     ("packaging", "nose_angle_deg", "Nose angle", "°", 0),
     ("packaging", "tail_angle_deg", "Tail angle", "°", 0),
+    ("packaging", "shape_solver", "Shape solver", None, None),
 )
 
 

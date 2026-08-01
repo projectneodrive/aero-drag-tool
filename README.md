@@ -134,6 +134,32 @@ not decided here: solve the shell and compare its Cd·A against the payload's.
 Tweak the angles or disable the stage entirely (`--no-streamline`, or the
 checkbox in the GUI's shape search) to see the difference in numbers.
 
+### The true loop: measuring the angles instead of assuming them
+
+The heuristic's 12°/45° are right *in general*; they are not right for this
+payload at this Reynolds number. The **shape solver** menu in the shape search
+offers the honest alternative: **True loop** puts the CFD solver inside the
+derivation. The heuristic shell is built first and flown as the baseline, then
+the loop walks the tail angle and the nose angle by golden-section search —
+tail first, because it dominates the trade — building a real shell at each
+step, solving it at screening quality with one backend, and reading Cd·A.
+
+What makes this affordable is *what* it optimises. Free-form shape
+optimisation needs adjoint gradients and hundreds of solves; this walks the
+envelope generator's own two parameters, where every candidate contains the
+payload by construction, no solve is wasted on an infeasible shape, and a
+budget of ~10 solves (settable as `refine_solves`) lands within a degree or
+two of the optimum. Expect minutes to an hour, watchable line by line in the
+progress log with a measured ETA from the first solve onward.
+
+The result is the argmin over everything flown — baseline included, so the
+loop can never hand back something worse than the heuristic. The measured
+angles are written into the run's own knobs (so deriving again starts from
+them), recorded in the shell panel with the gain over the heuristic, and the
+whole evaluation history is kept in the run file. It needs a live CFD
+backend, which is checked when you press the button rather than discovered
+half an hour into the queue.
+
 **Compare by Cd·A, not Cd.** A shape can post a flattering coefficient purely by
 being bigger, since Cd is normalised by the frontal area it is quoted on. On the
 mock trike the shell's Cd is comfortably below the bare payload's and it still

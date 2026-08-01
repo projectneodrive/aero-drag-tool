@@ -331,6 +331,13 @@ class PackagingSettings:
     streamline: bool = True
     nose_angle_deg: float = 45.0
     tail_angle_deg: float = 12.0
+    # "heuristic" builds the envelope at the angles above and stops. "cfd" then
+    # puts the solver in the loop: a budget of screening solves walks the tail
+    # and nose angles to whatever this payload at these conditions actually
+    # wants. Slow -- each step is a real CFD solve -- and worth it exactly when
+    # the rule-of-thumb angles are the thing you doubt.
+    shape_solver: str = "heuristic"  # or "cfd"
+    refine_solves: int = 10
 
     def to_dict(self) -> dict:
         return {
@@ -340,12 +347,17 @@ class PackagingSettings:
             "streamline": self.streamline,
             "nose_angle_deg": self.nose_angle_deg,
             "tail_angle_deg": self.tail_angle_deg,
+            "shape_solver": self.shape_solver,
+            "refine_solves": self.refine_solves,
         }
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "PackagingSettings":
         data = data or {}
         defaults = cls()
+        solver = str(data.get("shape_solver") or defaults.shape_solver)
+        if solver not in ("heuristic", "cfd"):
+            solver = defaults.shape_solver
         return cls(
             clearance=_as_float(data.get("clearance"), defaults.clearance),
             anisotropy=_as_float(data.get("anisotropy"), defaults.anisotropy),
@@ -353,6 +365,8 @@ class PackagingSettings:
             streamline=bool(data.get("streamline", defaults.streamline)),
             nose_angle_deg=_as_float(data.get("nose_angle_deg"), defaults.nose_angle_deg),
             tail_angle_deg=_as_float(data.get("tail_angle_deg"), defaults.tail_angle_deg),
+            shape_solver=solver,
+            refine_solves=max(int(data.get("refine_solves") or defaults.refine_solves), 3),
         )
 
 
