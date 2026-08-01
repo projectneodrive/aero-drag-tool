@@ -2,3 +2,15 @@ numpy
 scipy
 trimesh
 matplotlib
+
+# Volume meshing for the SU2 track (ships the gmsh SDK and executable).
+gmsh
+
+# Web GUI.
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Fairing generation: isosurface extraction and watertight containment tests.
+scikit-image
+rtree

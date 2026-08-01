@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aero drag tool</title>
+<link rel="stylesheet" href="/web/style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "/web/vendor/three.module.js",
+    "three/addons/controls/OrbitControls.js": "/web/vendor/OrbitControls.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark"></span>
+    <span class="brand-name">Aero drag tool</span>
+  </div>
+
+  <div class="scene-id">
+    <input id="scene-name" class="scene-name" type="text" placeholder="untitled" aria-label="Scene name" disabled>
+    <span id="scene-status" class="pill pill-muted">no scene</span>
+  </div>
+
+  <div class="topbar-actions">
+    <button id="btn-sample" class="btn" data-sample="cube">Sample cube</button>
+    <button id="btn-sample-trike" class="btn" data-sample="trike">Sample trike</button>
+    <label class="btn btn-file" for="file-stl">Import STL</label>
+    <input id="file-stl" type="file" accept=".stl" hidden>
+    <label class="btn btn-file" for="file-scene">Import scene</label>
+    <input id="file-scene" type="file" accept=".json" hidden>
+    <button id="btn-library" class="btn">Library</button>
+    <button id="btn-save" class="btn" disabled>Save</button>
+    <button id="btn-download" class="btn" disabled>Download scene</button>
+    <button id="btn-download-stl" class="btn" disabled>Download hull STL</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ------------------------------------------------ scene controls -->
+  <aside class="panel panel-left" aria-label="Scene controls">
+
+    <section class="group">
+      <h2 class="group-title">Packaging</h2>
+      <div id="controls-packaging" class="controls"></div>
+      <p class="hint" id="fairing-hint">
+        The imported STL is what has to fit inside. <strong>Analyse packaging</strong>
+        sweeps a closing radius and proposes one fairing per stable topology.
+      </p>
+
+      <div id="sweep-block" hidden>
+        <h3 class="subhead">Bodies vs closing radius</h3>
+        <div class="sweep-wrap"><canvas id="sweep-chart"></canvas></div>
+      </div>
+
+      <div id="candidate-list" class="candidate-list"></div>
+      <div id="fairing-warnings" class="warnings"></div>
+    </section>
+
+    <section class="group">
+      <h2 class="group-title">Wind</h2>
+      <div id="controls-wind" class="controls"></div>
+      <p class="hint">Azimuth turns in the ground plane from +X toward +Y. Elevation tilts above it.</p>
+    </section>
+
+    <section class="group">
+      <h2 class="group-title">Hull attitude</h2>
+      <div id="controls-orientation" class="controls"></div>
+      <button id="btn-reset-attitude" class="btn btn-quiet btn-wide">Reset to zero</button>
+    </section>
+
+    <section class="group">
+      <h2 class="group-title">Road</h2>
+      <div id="controls-road" class="controls"></div>
+    </section>
+
+    <section class="group">
+      <h2 class="group-title">Fluid</h2>
+      <div id="controls-fluid" class="controls"></div>
+    </section>
+
+    <section class="group">
+      <h2 class="group-title">Solvers</h2>
+      <div id="solver-list" class="solver-list"></div>
+      <div id="controls-solver" class="controls"></div>
+    </section>
+  </aside>
+
+  <!-- ------------------------------------------------------ viewport -->
+  <section class="viewport" aria-label="3D scene">
+    <canvas id="view"></canvas>
+
+    <div class="view-overlay view-overlay-top">
+      <div id="view-legend" class="view-legend">
+        <span class="key"><i class="swatch swatch-hull"></i>Hull</span>
+        <span class="key key-payload is-hidden"><i class="swatch swatch-payload"></i>Payload</span>
+        <span class="key"><i class="swatch swatch-wind"></i>Wind</span>
+        <span class="key key-road"><i class="swatch swatch-road"></i>Road</span>
+      </div>
+    </div>
+
+    <div class="view-overlay view-overlay-bottom">
+      <dl id="view-facts" class="facts"></dl>
+    </div>
+
+    <div id="view-empty" class="view-empty">
+      <p>No hull loaded.</p>
+      <p class="muted">Import an STL, import a scene file, or load the sample cube.</p>
+    </div>
+
+    <div class="view-hint">drag to orbit &middot; scroll to zoom &middot; right-drag to pan</div>
+  </section>
+
+  <!-- ------------------------------------------------------- results -->
+  <aside class="panel panel-right" aria-label="Results">
+
+    <section class="group">
+      <h2 class="group-title">Run</h2>
+
+      <div class="control" id="quality-control">
+        <label class="control-label" for="quality-select">Quality</label>
+        <select id="quality-select" class="control-select">
+          <option value="screening">Screening &mdash; fast, for ranking</option>
+          <option value="balanced">Balanced</option>
+          <option value="accurate">Accurate &mdash; slow, for the winner</option>
+        </select>
+      </div>
+
+      <div class="run-row">
+        <button id="btn-analyze" class="btn btn-wide" disabled>Analyse packaging</button>
+        <button id="btn-compare" class="btn btn-wide" disabled>Compare designs</button>
+      </div>
+      <div class="run-row">
+        <button id="btn-run" class="btn btn-primary btn-wide" disabled>Compute drag</button>
+      </div>
+
+      <div id="eta-line" class="eta"></div>
+      <div id="progress-bar" class="progress" hidden>
+        <div id="progress-fill" class="progress-fill"></div>
+      </div>
+      <p id="lock-note" class="lock-note" hidden>
+        Parameters are locked while the solver runs &mdash; the values on screen are
+        the ones being used.
+      </p>
+
+      <div id="reynolds-note" class="note note-info" hidden></div>
+      <div id="run-log" class="run-log" hidden></div>
+    </section>
+
+    <section class="group">
+      <h2 class="group-title">Geometry</h2>
+      <div id="geometry-tiles" class="tiles"></div>
+    </section>
+
+    <section class="group" id="results-section" hidden>
+      <div class="meta-block">
+        <input id="result-title" class="meta-title" type="text" placeholder="Untitled computation"
+               aria-label="Computation title">
+        <textarea id="result-description" class="meta-description" rows="2"
+                  placeholder="Notes on this computation…" aria-label="Computation description"></textarea>
+        <div id="result-stamp" class="meta-stamp"></div>
+      </div>
+
+      <div class="group-head">
+        <h2 class="group-title">Drag force over speed</h2>
+        <div class="seg" role="group" aria-label="View as">
+          <button id="btn-view-chart" class="seg-btn is-active" aria-pressed="true">Chart</button>
+          <button id="btn-view-table" class="seg-btn" aria-pressed="false">Table</button>
+        </div>
+      </div>
+
+      <div id="chart-legend" class="legend"></div>
+
+      <div id="chart-panels">
+        <div id="chart-wrap" class="chart-wrap">
+          <canvas id="chart"></canvas>
+          <div id="chart-tooltip" class="tooltip" hidden></div>
+        </div>
+
+        <!-- Cd on its own axes. Overlaying it on the force chart would be a
+             dual-axis plot, where the alignment of the two scales is arbitrary
+             and invents a relationship that is not in the data. -->
+        <h3 class="subhead">Drag coefficient over speed</h3>
+        <div id="cd-chart-wrap" class="chart-wrap chart-wrap-short">
+          <canvas id="cd-chart"></canvas>
+          <div id="cd-chart-tooltip" class="tooltip" hidden></div>
+        </div>
+      </div>
+
+      <div id="table-wrap" class="table-wrap" hidden></div>
+
+      <h3 class="subhead">Solver comparison</h3>
+      <div id="solver-tiles" class="tiles"></div>
+
+      <div id="ranking-block" hidden>
+        <h3 class="subhead">Design ranking</h3>
+        <div id="ranking-list" class="ranking"></div>
+      </div>
+
+      <div id="result-warnings" class="warnings"></div>
+    </section>
+
+  </aside>
+</main>
+
+<!-- ------------------------------------------------------------ modal -->
+<div id="library-modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="library-title">
+    <h2 id="library-title" class="modal-title">Scene library</h2>
+    <p class="hint" id="library-path"></p>
+    <div id="library-list" class="library-list"></div>
+    <div class="modal-actions">
+      <input id="library-name" type="text" class="text-input" placeholder="filename">
+      <button id="btn-library-save" class="btn btn-primary">Save current</button>
+      <button id="btn-library-close" class="btn">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script type="module" src="/web/app.js"></script>
+</body>
+</html>

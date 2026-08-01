@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.idea/
+
+# Machine-local solver timing measurements, used to calibrate run estimates.
+runtime_history.json
+
+# Saved scenes and generated solver cases.
+scenes/
+candidates/
