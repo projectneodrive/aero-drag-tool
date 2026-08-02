@@ -38,7 +38,7 @@
 <!-- Every tab is one run: a shape, its parameters and its results. -->
 <nav class="tabbar" id="tabbar" aria-label="Open runs"></nav>
 
-<main class="layout">
+<main class="layout" id="layout-main">
 
   <!-- ------------------------------------------------ this run's inputs -->
   <aside class="panel panel-left" id="panel-left" aria-label="Run parameters">
@@ -84,6 +84,7 @@
     <section class="group param-block" hidden>
       <h2 class="group-title">Road</h2>
       <div id="controls-road" class="controls"></div>
+      <p class="hint" id="road-hint"></p>
     </section>
 
     <section class="group param-block" hidden>
@@ -251,6 +252,22 @@
     </section>
 
   </aside>
+</main>
+
+<!-- ---------------------------------------------------------- queue view -->
+<!-- The pinned Queue tab shows this instead of a run. It is the line itself:
+     what is on the solver now, what waits behind it, and in which order. -->
+<main class="queue-view" id="queue-view" hidden aria-label="Solver queue">
+  <div class="queue-inner">
+    <h2 class="group-title">Solver queue</h2>
+    <p class="queue-lede">
+      One solve at a time &mdash; the solvers want the whole machine, so runs
+      line up here. A waiting run can be stopped, paused or reordered; the one
+      already on the solver has to finish.
+    </p>
+    <div id="queue-running"></div>
+    <div id="queue-list"></div>
+  </div>
 </main>
 
 <!-- ------------------------------------------------------------- modal -->

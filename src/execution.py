@@ -27,10 +27,13 @@ is what ``default_processes`` is for.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 import shutil
 import subprocess
+import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +51,162 @@ SU2_IMAGE = os.environ.get("AERO_SU2_IMAGE", "aero-drag-tool/su2:8.4.0")
 CONTAINER_CASE_DIR = "/case"
 
 MODES = ("native", "docker", "wsl")
+
+
+# --------------------------------------------------------------------------
+# Stopping a solve that is already running
+# --------------------------------------------------------------------------
+
+
+class Cancelled(BaseException):
+    """The solve on this thread was asked to stop.
+
+    Deliberately a :class:`BaseException`. The solver stack turns any ``Exception``
+    into a failed run with a log excerpt -- correct for a solver that crashed,
+    wrong for a user who pressed stop. Inheriting from ``BaseException`` puts
+    this in the same class as ``KeyboardInterrupt``: it unwinds through those
+    handlers instead of being recorded as a failure.
+    """
+
+
+@dataclass
+class CancelScope:
+    """The kill switch for one solve, and what it currently has running.
+
+    A solve is a long chain of short-lived external processes (mesh, decompose,
+    solve, reconstruct), so stopping it is two things: kill whatever is running
+    right now, and refuse to start the next one. Both live here.
+    """
+
+    cancelled: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _processes: set = field(default_factory=set, repr=False)
+    _containers: set = field(default_factory=set, repr=False)
+
+    def cancel(self) -> None:
+        """Ask the solve to stop, killing anything already in flight."""
+        with self._lock:
+            self.cancelled = True
+            processes = list(self._processes)
+            containers = list(self._containers)
+
+        for name in containers:
+            # A detached client leaves the container running, so the container
+            # has to be stopped by name rather than by killing `docker run`.
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(
+                    ["docker", "kill", name],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+        for process in processes:
+            with contextlib.suppress(OSError):
+                process.kill()
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise Cancelled("The solve was stopped")
+
+    def _attach(self, process, container: str = "") -> None:
+        with self._lock:
+            self._processes.add(process)
+            if container:
+                self._containers.add(container)
+
+    def _detach(self, process, container: str = "") -> None:
+        with self._lock:
+            self._processes.discard(process)
+            if container:
+                self._containers.discard(container)
+
+
+# Keyed by thread: the queue runs one solve at a time on its own thread, and
+# every solver process is spawned from that same thread. That makes the scope
+# discoverable from deep inside a backend without threading a token through
+# every call between here and the solver.
+_scopes: dict[int, CancelScope] = {}
+_scopes_lock = threading.Lock()
+
+
+def current_scope() -> CancelScope | None:
+    with _scopes_lock:
+        return _scopes.get(threading.get_ident())
+
+
+@contextlib.contextmanager
+def cancel_scope():
+    """Make everything this thread runs from here on stoppable."""
+    scope = CancelScope()
+    ident = threading.get_ident()
+    with _scopes_lock:
+        _scopes[ident] = scope
+    try:
+        yield scope
+    finally:
+        with _scopes_lock:
+            _scopes.pop(ident, None)
+
+
+def checkpoint() -> None:
+    """Give up here if a stop was asked for. Cheap; call between solver steps."""
+    scope = current_scope()
+    if scope is not None:
+        scope.raise_if_cancelled()
+
+
+def run_process(
+    command: list[str],
+    *,
+    check: bool = False,
+    capture_output: bool = False,
+    timeout: int | None = None,
+    cwd: str | Path | None = None,
+    stdout=None,
+    stderr=None,
+    container: str = "",
+) -> subprocess.CompletedProcess[str]:
+    """``subprocess.run``, but killable while it runs.
+
+    Registered with the calling thread's :class:`CancelScope` so a stop request
+    from the web thread can reach the solver. Outside a scope this is exactly
+    ``subprocess.run``.
+    """
+    scope = current_scope()
+    if scope is not None:
+        scope.raise_if_cancelled()
+
+    if capture_output:
+        stdout, stderr = subprocess.PIPE, subprocess.PIPE
+
+    process = subprocess.Popen(  # noqa: S603 - commands are built here, not user input
+        command,
+        cwd=str(cwd) if cwd is not None else None,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+    )
+    if scope is not None:
+        scope._attach(process, container)
+    try:
+        out, err = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    finally:
+        if scope is not None:
+            scope._detach(process, container)
+
+    # A killed solver exits non-zero and writes a truncated log. Ask first, so
+    # that reads as "stopped" rather than as a solver that fell over.
+    if scope is not None:
+        scope.raise_if_cancelled()
+
+    completed = subprocess.CompletedProcess(command, process.returncode, out, err)
+    if check:
+        completed.check_returncode()
+    return completed
 
 
 # --------------------------------------------------------------------------
@@ -219,24 +378,32 @@ class Runner:
             inner = f"{inner} && {cd}" if inner else cd
         inner = f"{inner} && {script}" if inner else script
 
+        container = ""
         if self.mode == "docker":
-            command = _docker_command(self.image, case_dir, inner)
+            # Named so that stopping the run can reach the container itself;
+            # killing the `docker run` client would leave it solving.
+            container = f"aero-{uuid.uuid4().hex[:12]}"
+            command = _docker_command(self.image, case_dir, inner, name=container)
         elif self.mode == "wsl":
             command = _wsl_command(self.distro, inner, as_root=self.as_root)
         else:
             command = ["bash", "-lc", inner]
 
-        return subprocess.run(
+        return run_process(
             command,
             check=check,
             capture_output=capture_output,
-            text=True,
             timeout=timeout,
+            container=container,
         )
 
 
-def _docker_command(image: str, case_dir: str | Path | None, script: str) -> list[str]:
+def _docker_command(
+    image: str, case_dir: str | Path | None, script: str, name: str = ""
+) -> list[str]:
     command = ["docker", "run", "--rm"]
+    if name:
+        command += ["--name", name]
     if case_dir is not None:
         source = Path(case_dir).resolve()
         # --mount rather than -v: its source=,target= syntax is not confused by

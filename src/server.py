@@ -45,8 +45,9 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import estimates
+import execution
 import fairing as fairing_module
-from execution import available_cores, default_processes
+from execution import Cancelled, available_cores, default_processes
 from runs import Run, RunStore, base_name, fork
 from scene import KNOWN_BACKENDS, FairingSpec, Geometry, Scene
 from solvers import available_solvers, run_scene
@@ -76,6 +77,10 @@ class Job:
         self.kind = kind
         self.backends = list(backends or [])
         self.status = "queued"
+        self.held = False
+        # Set once the worker starts, so a stop request from a web thread can
+        # reach the solver processes this job has running.
+        self.scope: execution.CancelScope | None = None
         self.events: list[dict] = []
         self.error: str | None = None
         self.started = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -101,6 +106,8 @@ class Job:
                 "run_id": self.run_id,
                 "kind": self.kind,
                 "status": self.status,
+                "held": self.held,
+                "stopping": bool(self.scope is not None and self.scope.cancelled),
                 "backends": self.backends,
                 "started": self.started,
                 "elapsed_seconds": time.time() - self.started_at,
@@ -148,14 +155,59 @@ class JobQueue:
                     return True
             return False
 
+    def hold(self, job_id: str) -> bool:
+        """Keep a waiting job in the line but let others pass it."""
+        with self._cv:
+            for job, _ in self._pending:
+                if job.id == job_id:
+                    job.held = True
+                    return True
+            return False
+
+    def release(self, job_id: str) -> bool:
+        """Put a held job back in the running order."""
+        with self._cv:
+            for job, _ in self._pending:
+                if job.id == job_id:
+                    job.held = False
+                    self._cv.notify()
+                    return True
+            return False
+
+    def move(self, job_id: str, direction: str) -> bool:
+        """Swap a waiting job with its neighbour, 'up' meaning sooner."""
+        with self._cv:
+            for index, entry in enumerate(self._pending):
+                if entry[0].id != job_id:
+                    continue
+                other = index - 1 if direction == "up" else index + 1
+                if other < 0 or other >= len(self._pending):
+                    return False
+                self._pending[index], self._pending[other] = (
+                    self._pending[other],
+                    self._pending[index],
+                )
+                return True
+            return False
+
     def position(self, job_id: str) -> int | None:
-        """0 while running, 1 and up while waiting, None once it is over."""
+        """0 while running, 1 and up while waiting, None once it is over.
+
+        Held jobs are not numbered: the count says how many solves happen
+        before yours, and a held job happens after every numbered one.
+        """
         with self._cv:
             if self._current is not None and self._current.id == job_id:
                 return 0
-            for index, (job, _) in enumerate(self._pending):
+            count = 0
+            for job, _ in self._pending:
+                if job.held:
+                    if job.id == job_id:
+                        return None
+                    continue
+                count += 1
                 if job.id == job_id:
-                    return index + 1
+                    return count
             return None
 
     def current(self) -> Job | None:
@@ -169,14 +221,32 @@ class JobQueue:
     def _loop(self) -> None:
         while True:
             with self._cv:
-                while not self._pending:
+                # A held job keeps its place but is passed over; when everything
+                # waiting is held the solver simply sits until one is released.
+                while True:
+                    index = next(
+                        (i for i, (job, _) in enumerate(self._pending) if not job.held),
+                        None,
+                    )
+                    if index is not None:
+                        break
                     self._cv.wait()
-                job, work = self._pending.pop(0)
+                job, work = self._pending.pop(index)
                 self._current = job
             try:
                 job.status = "running"
                 job.started_at = time.time()
-                work()
+                # Everything the worker spawns from here is killable: the scope
+                # is what /stop reaches into.
+                with execution.cancel_scope() as scope:
+                    job.scope = scope
+                    work()
+            except Cancelled:
+                # Caught here as well as in the workers: a stop that lands in
+                # the gap before a worker's own handler must not take the queue
+                # thread down with it, or nothing would ever solve again.
+                job.status = "cancelled"
+                job.add_event({"phase": "stopped", "message": "Stopped"})
             except Exception as error:  # a worker that dies must not stall the queue
                 job.status = "failed"
                 job.error = f"{type(error).__name__}: {error}"
@@ -240,25 +310,59 @@ def display_scene(run: Run) -> Scene:
     return run.scene
 
 
-# Probing for OpenFOAM and SU2 shells out to WSL or Docker, which costs the
-# best part of a second. What it finds changes when somebody installs a
-# solver, not between two clicks, so it is worth a short memo.
+# Probing for OpenFOAM and SU2 shells out to WSL and Docker, which costs about
+# three seconds -- `docker info`, `docker image inspect` and a WSL round trip,
+# none of which can be hurried. What it finds changes when somebody installs a
+# solver, so the answer is worth keeping.
+#
+# It is never waited on. A stale answer is served immediately and refreshed on
+# a background thread, because the alternative is that the first click after a
+# quiet minute blocks for three seconds -- which reads as a click that missed,
+# and gets clicked again.
 SOLVER_PROBE_SECONDS = 30.0
 _solver_probe: tuple[float, int | None, list[dict]] | None = None
+_probe_lock = threading.Lock()
+_probe_inflight = False
+
+
+def _probe_solvers(processes: int | None) -> list[dict]:
+    global _solver_probe
+    infos = [info.to_dict() for info in available_solvers(processes)]
+    with _probe_lock:
+        _solver_probe = (time.time(), processes, infos)
+    return infos
+
+
+def _refresh_solvers_soon(processes: int | None) -> None:
+    """Re-probe off the request thread, one at a time."""
+    global _probe_inflight
+    with _probe_lock:
+        if _probe_inflight:
+            return
+        _probe_inflight = True
+
+    def work() -> None:
+        global _probe_inflight
+        try:
+            _probe_solvers(processes)
+        except Exception:  # a probe that fails must not stop the next one
+            pass
+        finally:
+            with _probe_lock:
+                _probe_inflight = False
+
+    threading.Thread(target=work, name="aero-solver-probe", daemon=True).start()
 
 
 def solver_infos(processes: int | None) -> list[dict]:
-    global _solver_probe
-    now = time.time()
-    if (
-        _solver_probe is not None
-        and _solver_probe[1] == processes
-        and now - _solver_probe[0] < SOLVER_PROBE_SECONDS
-    ):
-        return _solver_probe[2]
-    infos = [info.to_dict() for info in available_solvers(processes)]
-    _solver_probe = (now, processes, infos)
-    return infos
+    with _probe_lock:
+        memo = _solver_probe
+    if memo is None:
+        # Nothing to serve yet. Only reachable before the startup probe lands.
+        return _probe_solvers(processes)
+    if memo[1] != processes or time.time() - memo[0] >= SOLVER_PROBE_SECONDS:
+        _refresh_solvers_soon(processes)
+    return memo[2]
 
 
 # A run's geometry never changes once it exists -- edits go to a fork, and the
@@ -380,7 +484,12 @@ def activity_payload() -> dict:
         "active_id": store.active_id,
         "running": current.snapshot() if current is not None else None,
         "queue": [
-            {"job_id": job.id, "run_id": job.run_id, "position": queue.position(job.id)}
+            {
+                "job_id": job.id,
+                "run_id": job.run_id,
+                "position": queue.position(job.id),
+                "held": job.held,
+            }
             for job in queue.waiting()
         ],
     }
@@ -522,21 +631,98 @@ def activate_run(run_id: str) -> dict:
     return {"active_id": run_id}
 
 
-@app.post("/api/runs/{run_id}/cancel")
-def cancel_run(run_id: str) -> dict:
-    """Take a run back out of the queue. A running one has to finish."""
-    run = require_run(run_id)
-    if run.status != "queued" or not run.job_id:
-        raise HTTPException(status_code=409, detail=f"{run.title} is not waiting in the queue")
-    if not queue.cancel(run.job_id):
-        raise HTTPException(status_code=409, detail=f"{run.title} has already started")
-    # Cancelling releases the inputs again, so the run goes back to what it was
-    # before it was asked for. Nothing went wrong, so it is not a failure.
+def _release_stopped(run: Run) -> None:
+    """Put a stopped run back to what it was before it was asked for.
+
+    Stopping is a decision, not a failure: the run keeps whatever results it
+    already had, gets its parameters unfrozen, and can be edited and re-run in
+    place. A half-finished solve leaves nothing behind worth keeping.
+    """
     run.status = "done" if run.computed else "draft"
     run.job_id = None
     if not run.computed:
         run.solved_params = None
+
+
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_run(run_id: str) -> dict:
+    """Take a run back out of the queue, whether it is waiting or solving."""
+    run = require_run(run_id)
+    if run.status == "running":
+        return stop_run(run_id)
+    if run.status != "queued" or not run.job_id:
+        raise HTTPException(status_code=409, detail=f"{run.title} is not waiting in the queue")
+    if not queue.cancel(run.job_id):
+        # It reached the front between the click and this request.
+        return stop_run(run_id)
+    # Cancelling releases the inputs again, so the run goes back to what it was
+    # before it was asked for. Nothing went wrong, so it is not a failure.
+    _release_stopped(run)
     return {"run": run_payload(run), "state": state_payload()}
+
+
+@app.post("/api/runs/{run_id}/stop")
+def stop_run(run_id: str) -> dict:
+    """Kill the solve that is running now and hand the machine to the next one.
+
+    The solvers are external processes, so this really does stop them: whatever
+    is in flight is killed and the chain refuses to start its next step. The
+    run keeps nothing from the partial solve -- an abandoned solve has no
+    trustworthy numbers in it -- and goes back to being editable.
+    """
+    run = require_run(run_id)
+    # "Solving" means its job is the one on the machine -- a firmer test than
+    # the run's own label, which the worker sets a moment after it starts.
+    current = queue.current()
+    if not run.job_id or current is None or current.id != run.job_id:
+        raise HTTPException(status_code=409, detail=f"{run.title} is not solving")
+    job = jobs.get(run.job_id)
+    if job is None or job.scope is None:
+        raise HTTPException(status_code=409, detail=f"{run.title} has not started solving yet")
+
+    job.add_event({"phase": "stopping", "message": "Stopping the solver…"})
+    job.scope.cancel()
+    # The worker unwinds on its own thread and sets the run's own state; this
+    # returns as soon as the kill is issued rather than blocking the browser on
+    # however long the solver takes to die.
+    return {"run": run_payload(run), "state": state_payload()}
+
+
+def _require_waiting(run_id: str) -> Run:
+    """The queue verbs only make sense for a run still in the line."""
+    run = require_run(run_id)
+    if run.status != "queued" or not run.job_id:
+        raise HTTPException(status_code=409, detail=f"{run.title} is not waiting in the queue")
+    return run
+
+
+@app.post("/api/runs/{run_id}/hold")
+def hold_run(run_id: str) -> dict:
+    """Pause a waiting run: it keeps its place but the solver passes it by."""
+    run = _require_waiting(run_id)
+    if not queue.hold(run.job_id):
+        raise HTTPException(status_code=409, detail=f"{run.title} has already started")
+    return activity_payload()
+
+
+@app.post("/api/runs/{run_id}/release")
+def release_run(run_id: str) -> dict:
+    """Put a paused run back in the running order."""
+    run = _require_waiting(run_id)
+    if not queue.release(run.job_id):
+        raise HTTPException(status_code=409, detail=f"{run.title} has already started")
+    return activity_payload()
+
+
+@app.post("/api/runs/{run_id}/move")
+def move_run(run_id: str, body: dict) -> dict:
+    """Swap a waiting run with its queue neighbour, 'up' meaning sooner."""
+    run = _require_waiting(run_id)
+    direction = str(body.get("direction") or "")
+    if direction not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="direction must be 'up' or 'down'")
+    queue.move(run.job_id, direction)  # already at the edge is not an error
+    return activity_payload()
 
 
 @app.delete("/api/runs/{run_id}")
@@ -549,7 +735,7 @@ def close_run(run_id: str) -> dict:
     elif run.status == "running":
         raise HTTPException(
             status_code=409,
-            detail=f"{run.title} is solving. Let it finish before closing it.",
+            detail=f"{run.title} is solving. Stop it from the Queue tab, then close it.",
         )
     store.remove(run_id)
     _metrics_cache.pop(run_id, None)
@@ -752,6 +938,9 @@ def compute_run(run_id: str, body: dict | None = None) -> dict:
             target.duration_s = time.time() - started
             job.status = "done"
             job.add_event({"phase": "done", "message": "Run complete"})
+        except Cancelled:
+            _release_stopped(target)
+            raise  # the queue records the job; this only frees the run
         except Exception as error:  # surfaced to the UI rather than swallowed
             target.status = "failed"
             target.error = f"{type(error).__name__}: {error}"
@@ -988,6 +1177,9 @@ def derive_shape(run_id: str) -> dict:
                     + (f" ({gain * 100:+.1f}% Cd·A)" if gain is not None else "")
                 )
             job.add_event({"phase": "done", "message": done_message})
+        except Cancelled:
+            _release_stopped(run)
+            raise  # the queue records the job; this only frees the run
         except Exception as error:
             run.status = "failed"
             run.error = f"{type(error).__name__}: {error}"
@@ -1207,6 +1399,10 @@ def main(argv: list[str] | None = None) -> int:
         _run_from_scene(Scene.load(args.scene), "opened", f"Opened from {args.scene}.")
 
     import uvicorn
+
+    # Probe while the browser is still starting, so the first page load reads a
+    # warm memo instead of paying for it.
+    _refresh_solvers_soon(None)
 
     url = f"http://{args.host}:{args.port}"
     print(f"Aero drag GUI on {url}")

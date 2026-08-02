@@ -548,9 +548,11 @@ def _farfield_patches() -> tuple[str, ...]:
     return ("xmin", "xmax", "ymin", "ymax", "zmax")
 
 
-def _field_u(wind_vector: np.ndarray, ground: bool, moving_ground: bool) -> str:
+def _field_u(wind_vector: np.ndarray, ground: bool, road_velocity: np.ndarray | None) -> str:
     ux, uy, uz = np.asarray(wind_vector, dtype=float)
     free = f"({ux:.10g} {uy:.10g} {uz:.10g})"
+    road = np.zeros(3) if road_velocity is None else np.asarray(road_velocity, dtype=float)
+    road_moves = bool(np.linalg.norm(road) > 1e-12)
 
     blocks = []
     for patch in _farfield_patches():
@@ -563,13 +565,15 @@ def _field_u(wind_vector: np.ndarray, ground: bool, moving_ground: bool) -> str:
     }}"""
         )
 
-    if ground and moving_ground:
-        # A road sliding underneath the body at free-stream speed: the usual
-        # way to avoid growing a spurious floor boundary layer.
+    if ground and road_moves:
+        # A road sliding underneath the body at the vehicle's ground speed:
+        # the usual way to avoid growing a floor boundary layer no real road
+        # has. A translating wall is a plain fixedValue -- movingWallVelocity
+        # is for a wall the *mesh* follows, which is not this.
         zmin = f"""    zmin
     {{
         type            fixedValue;
-        value           uniform {free};
+        value           uniform {_vector_to_foam(road)};
     }}"""
     elif ground:
         zmin = """    zmin
@@ -665,7 +669,6 @@ def _turbulence_field(
     value: float,
     wall_type: str,
     ground: bool,
-    ground_is_wall: bool,
 ) -> str:
     literal = _foam_scalar(value)
     blocks = []
@@ -679,7 +682,10 @@ def _turbulence_field(
     }}"""
         )
 
-    if ground and ground_is_wall:
+    if ground:
+        # Wall functions whether or not the road is moving. blockMesh already
+        # made zmin a wall patch, and a road running at anything other than the
+        # free-stream speed shears against the air like any other wall does.
         blocks.append(
             f"""    zmin
     {{
@@ -865,11 +871,15 @@ def prepare_openfoam_case(
     iterations: int = 400,
     mesh_resolution: int = 40,
     refinement_level: int = 3,
-    moving_ground: bool = False,
+    road_velocity: np.ndarray | None = None,
     n_processors: int = 1,
     reference_area: float | None = None,
 ) -> dict:
-    """Write a complete OpenFOAM case and return the reference quantities used."""
+    """Write a complete OpenFOAM case and return the reference quantities used.
+
+    ``road_velocity`` is the ground plane's own velocity: None or zero leaves
+    it a stationary wall, anything else makes it slide underneath the body.
+    """
     case_dir.mkdir(parents=True, exist_ok=True)
     (case_dir / "0").mkdir(exist_ok=True)
     (case_dir / "constant").mkdir(exist_ok=True)
@@ -921,22 +931,21 @@ def prepare_openfoam_case(
     (case_dir / "constant" / "physicalProperties").write_text(
         _physical_properties(density, kinematic_viscosity), encoding="utf-8"
     )
-    (case_dir / "0" / "U").write_text(_field_u(wind_vector, ground, moving_ground), encoding="utf-8")
+    (case_dir / "0" / "U").write_text(_field_u(wind_vector, ground, road_velocity), encoding="utf-8")
     (case_dir / "0" / "p").write_text(_field_p(ground), encoding="utf-8")
 
     if turbulent:
         k_value, omega_value, nut_value = turbulence_seed(speed, reference_length)
-        ground_is_wall = ground and not moving_ground
         (case_dir / "0" / "k").write_text(
-            _turbulence_field("k", "volScalarField", "[0 2 -2 0 0 0 0]", k_value, "kqRWallFunction", ground, ground_is_wall),
+            _turbulence_field("k", "volScalarField", "[0 2 -2 0 0 0 0]", k_value, "kqRWallFunction", ground),
             encoding="utf-8",
         )
         (case_dir / "0" / "omega").write_text(
-            _turbulence_field("omega", "volScalarField", "[0 0 -1 0 0 0 0]", omega_value, "omegaWallFunction", ground, ground_is_wall),
+            _turbulence_field("omega", "volScalarField", "[0 0 -1 0 0 0 0]", omega_value, "omegaWallFunction", ground),
             encoding="utf-8",
         )
         (case_dir / "0" / "nut").write_text(
-            _turbulence_field("nut", "volScalarField", "[0 2 -1 0 0 0 0]", nut_value, "nutkWallFunction", ground, ground_is_wall),
+            _turbulence_field("nut", "volScalarField", "[0 2 -1 0 0 0 0]", nut_value, "nutkWallFunction", ground),
             encoding="utf-8",
         )
 
@@ -958,6 +967,7 @@ def prepare_openfoam_case(
         "domain_max": domain_max.tolist(),
         "cells": list(_block_cell_counts(domain_min, domain_max, mesh_resolution)),
         "speed": speed,
+        "road_speed": float(np.linalg.norm(road_velocity)) if road_velocity is not None else 0.0,
     }
 
 
@@ -1015,7 +1025,7 @@ def run_openfoam_drag(
     iterations: int = 400,
     mesh_resolution: int = 40,
     refinement_level: int = 3,
-    moving_ground: bool = False,
+    road_velocity: np.ndarray | None = None,
     n_processors: int | None = None,
     reference_area: float | None = None,
 ) -> OpenFOAMResult:
@@ -1045,7 +1055,7 @@ def run_openfoam_drag(
         iterations=iterations,
         mesh_resolution=mesh_resolution,
         refinement_level=refinement_level,
-        moving_ground=moving_ground,
+        road_velocity=road_velocity,
         n_processors=n_processors,
         reference_area=reference_area,
     )
@@ -1095,7 +1105,8 @@ def run_openfoam_drag(
             "iterations": iterations,
             "mesh_resolution": mesh_resolution,
             "refinement_level": refinement_level,
-            "moving_ground": moving_ground,
+            "moving_ground": bool(setup["road_speed"] > 1e-12),
+            "road_speed": float(setup["road_speed"]),
             "n_processors": n_processors,
             "execution": runner.describe(),
             "background_cells": setup["cells"],

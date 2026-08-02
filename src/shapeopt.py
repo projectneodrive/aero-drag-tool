@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 
 import trimesh
 
+import execution
 import fairing
 from scene import Geometry, Scene
 from solvers import run_scene
@@ -217,6 +218,9 @@ def refine_envelope(
         budget["left"] -= 1
 
         started = time.time()
+        # Building a candidate shell is in-process work between two solves, so
+        # it is where a stop would otherwise go unnoticed for minutes.
+        execution.checkpoint()
         if shell is None:
             shell = build_shell(*key)
         trial = _screening_scene(scene, shell.mesh, backend)
