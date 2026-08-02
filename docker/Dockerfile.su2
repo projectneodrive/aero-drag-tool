@@ -26,6 +26,12 @@ ARG SU2_PREFIX=/opt/su2
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# python3-setuptools, not python3-distutils. Ubuntu 24.04 ships Python 3.12,
+# which dropped distutils from the standard library, and Ubuntu dropped the
+# python3-distutils package with it -- so asking for it fails the build
+# outright ("has no installation candidate"). setuptools is the supported
+# replacement: it installs distutils-precedence.pth, which makes a plain
+# `import distutils` resolve to setuptools._distutils.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -34,7 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openmpi-bin \
         pkg-config \
         python3 \
-        python3-distutils \
+        python3-setuptools \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
