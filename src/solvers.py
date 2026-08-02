@@ -23,6 +23,7 @@ import numpy as np
 import trimesh
 
 import estimates
+import execution
 from metrics import geometry_metrics, reynolds
 from scene import ResultSet, Scene, SolverRun, SpeedPoint
 
@@ -138,7 +139,9 @@ def _solve_openfoam(
         iterations=scene.solver.iterations,
         mesh_resolution=scene.solver.mesh_resolution,
         refinement_level=scene.solver.refinement_level,
-        moving_ground=scene.road.enabled and scene.road.moving,
+        # Taken at this speed, not at the scene's: on a sweep the road has to
+        # keep up with the vehicle unless it was pinned to a speed of its own.
+        road_velocity=scene.road_velocity(speed),
         n_processors=scene.solver.processes,
         reference_area=reference_area,
     )
@@ -176,6 +179,7 @@ def _solve_su2(
         refinement_level=scene.solver.refinement_level,
         processes=scene.solver.processes,
         reference_area=reference_area,
+        road_velocity=scene.road_velocity(speed),
     )
     return PointSolution(
         drag_coefficient=result.drag_coefficient,
@@ -278,6 +282,10 @@ def run_backend(
         if case_root is not None:
             work_dir = Path(case_root) / f"{backend}_{index:02d}"
         unit_started = time.time()
+        # Meshing happens in-process, so a stop pressed during it is only seen
+        # here. Checking per speed point keeps a stopped sweep from starting
+        # the next one it was never going to need.
+        execution.checkpoint()
         try:
             solution = solve(
                 scene,
@@ -385,6 +393,7 @@ def run_scene(
             "The STL is not watertight. Meshing may fail and the frontal area is computed "
             "from every face rather than the windward side only."
         )
+    warnings.extend(_road_warnings(scene, mode))
 
     # Plan the run before starting it, so the user is told what they are in
     # for rather than watching an indeterminate spinner.
@@ -418,6 +427,7 @@ def run_scene(
     runs: list[SolverRun] = []
     try:
         for backend in backend_list:
+            execution.checkpoint()
             run = run_backend(
                 scene,
                 backend,
@@ -453,6 +463,39 @@ def run_scene(
         runs=runs,
         warnings=warnings,
     )
+
+
+def _road_warnings(scene: Scene, mode: str) -> list[str]:
+    """Flag the ways a moving road can quietly not mean what it looks like."""
+    road = scene.road
+    if not (road.enabled and road.moving):
+        return []
+
+    warnings: list[str] = []
+    if float(np.linalg.norm(scene.road_velocity())) < 1e-12:
+        if road.speed is not None and abs(road.speed) < 1e-12:
+            warnings.append(
+                "The road is set to move at 0 m/s, which is a stationary floor -- "
+                "the same as switching the motion off."
+            )
+        else:
+            warnings.append(
+                "The wind is vertical, so the road has no heading to run along and is "
+                "being solved as a stationary floor."
+            )
+        return warnings
+
+    if road.speed is not None and mode == "scale":
+        # Cd is speed-independent only while the whole flow field scales with
+        # the free stream. A road held at a fixed speed changes its share of
+        # the picture at every other point on the curve.
+        warnings.append(
+            f"The road is pinned to {road.speed:.4g} m/s while the curve is scaled from one "
+            f"solve at {scene.solver.reference_speed:.4g} m/s. Cd only holds along that curve "
+            "if the road keeps pace with the air -- solve every speed, or leave the road "
+            "speed blank so it tracks the wind."
+        )
+    return warnings
 
 
 def _comparison_warnings(runs: list[SolverRun]) -> list[str]:

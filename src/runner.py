@@ -55,6 +55,14 @@ def _apply_common_options(scene: Scene, args: argparse.Namespace) -> Scene:
         scene.road.ride_height = float(args.ground)
     if getattr(args, "moving_road", False):
         scene.road.moving = True
+    if getattr(args, "road_speed", None) is not None:
+        # Naming a speed is only meaningful for a road that runs, so asking for
+        # one turns the motion on rather than being silently ignored.
+        scene.road.moving = True
+        scene.road.speed = float(args.road_speed)
+    if getattr(args, "road_tracks_wind", False):
+        scene.road.moving = True
+        scene.road.speed = None
 
     if getattr(args, "density", None) is not None:
         scene.fluid.density = float(args.density)
@@ -98,7 +106,23 @@ def _add_scene_options(parser: argparse.ArgumentParser) -> None:
     placement.add_argument("--roll", type=float, help="Hull roll in degrees")
     placement.add_argument("--ground", type=float, help="Ride height above the road in metres")
     placement.add_argument("--no-road", action="store_true", help="Remove the road entirely")
-    placement.add_argument("--moving-road", action="store_true", help="Road slides at free-stream speed")
+    placement.add_argument(
+        "--moving-road",
+        action="store_true",
+        help="Road slides underneath the body, as one does under a moving vehicle",
+    )
+    placement.add_argument(
+        "--road-speed",
+        type=float,
+        metavar="V",
+        help="Ground speed of the vehicle in m/s (implies --moving-road). "
+        "Omit it and the road tracks the wind, which is the still-air case",
+    )
+    placement.add_argument(
+        "--road-tracks-wind",
+        action="store_true",
+        help="Unpin the road speed so it follows the wind again",
+    )
 
     solving = parser.add_argument_group("solving")
     solving.add_argument("--solver", action="append", choices=["openfoam", "su2"], help="Repeatable")
@@ -184,7 +208,12 @@ def command_show(args: argparse.Namespace) -> int:
     print(f"Attitude: yaw {scene.orientation.yaw_deg:.4g}, pitch {scene.orientation.pitch_deg:.4g}, "
           f"roll {scene.orientation.roll_deg:.4g} deg")
     if scene.road.enabled:
-        kind = "moving" if scene.road.moving else "static"
+        if not scene.road.moving:
+            kind = "static"
+        elif scene.road.speed is None:
+            kind = f"moving with the wind ({scene.road.ground_speed(scene.wind_vector()):.4g} m/s)"
+        else:
+            kind = f"moving at {scene.road.speed:.4g} m/s"
         print(f"Road    : {kind}, ride height {scene.road.ride_height:.4g} m")
     else:
         print("Road    : disabled")
@@ -267,7 +296,7 @@ def command_export(args: argparse.Namespace) -> int:
             iterations=scene.solver.iterations,
             mesh_resolution=scene.solver.mesh_resolution,
             refinement_level=scene.solver.refinement_level,
-            moving_ground=scene.road.enabled and scene.road.moving,
+            road_velocity=scene.road_velocity(speed),
             reference_area=metrics.frontal_area,
         )
         (case / "Allrun").write_text(
@@ -295,6 +324,7 @@ def command_export(args: argparse.Namespace) -> int:
             surface_cells=max(scene.solver.mesh_resolution // 2, 8),
             refinement_level=scene.solver.refinement_level,
             reference_area=metrics.frontal_area,
+            road_velocity=scene.road_velocity(speed),
         )
         (case / "Allrun").write_text("#!/bin/sh\nSU2_CFD case.cfg > log.su2 2>&1\n", encoding="utf-8")
         written.append(str(case))

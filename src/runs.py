@@ -53,7 +53,8 @@ TRACKED_PARAMETERS: tuple[tuple[str, str, str, str | None, int | None], ...] = (
     ("orientation", "roll_deg", "Roll", "°", 1),
     ("road", "enabled", "Road present", None, None),
     ("road", "ride_height", "Ride height", "m", 3),
-    ("road", "moving", "Road moves with the flow", None, None),
+    ("road", "moving", "Road moves under the body", None, None),
+    ("road", "speed", "Road speed", "m/s", 2),
     ("fluid", "density", "Air density", "kg/m³", 4),
     ("fluid", "viscosity", "Viscosity", "Pa·s", None),
     ("solver", "backends", "Solvers", None, None),
@@ -77,6 +78,7 @@ TRACKED_PACKAGING: tuple[tuple[str, str, str, str | None, int | None], ...] = (
     ("packaging", "streamline", "Streamlined envelope", None, None),
     ("packaging", "nose_angle_deg", "Nose angle", "°", 0),
     ("packaging", "tail_angle_deg", "Tail angle", "°", 0),
+    ("packaging", "shape_solver", "Shape solver", None, None),
 )
 
 
@@ -191,6 +193,12 @@ class Run:
             value = self.solved_params.get(f"{section}.{key}")
             if value is None and section == "solver" and key == "processes":
                 value = "auto"
+            # An unset road speed means the road kept pace with the wind, which
+            # is worth saying: the record has to be readable years later, and
+            # a dash beside a road that was moving invites the wrong guess.
+            if value is None and section == "road" and key == "speed":
+                if self.solved_params.get("road.moving"):
+                    value = "tracked the wind"
             grouped.setdefault(section, []).append(
                 f"{label} {_format_value(value, unit, decimals)}"
             )

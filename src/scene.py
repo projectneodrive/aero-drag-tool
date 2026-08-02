@@ -69,6 +69,16 @@ def _as_optional_int(value: Any) -> int | None:
     return number if number > 0 else None
 
 
+def _as_optional_float(value: Any) -> float | None:
+    """A float, or None for "unset". Junk reads as unset; zero is a real value."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class Orientation:
     """Hull attitude in degrees, applied about the mesh centroid as Rz*Ry*Rx."""
@@ -167,14 +177,34 @@ class Wind:
 
 @dataclass
 class Road:
-    """Static ground plane at z = 0 with the hull ``ride_height`` above it."""
+    """Ground plane at z = 0 with the hull ``ride_height`` above it.
+
+    The solve sits in the vehicle's frame: the body is held still, the air
+    arrives at the wind speed, and a road the vehicle is driving on has to
+    slide underneath it. ``moving`` is that distinction -- a stationary road is
+    a wind-tunnel floor, which grows a boundary layer no real road has.
+
+    ``speed`` is the vehicle's speed over the ground. Left unset it tracks the
+    wind, which is the still-air case: park the air, and the speed the vehicle
+    feels is the speed it is doing. Pinning it is the atmospheric-wind case,
+    where the two differ -- 25 m/s over the ground into a 5 m/s headwind is a
+    30 m/s wind over a 25 m/s road, and only the road knows the difference.
+    """
 
     enabled: bool = True
     ride_height: float = 0.15
-    moving: bool = False  # False: stationary no-slip wall. True: wall moving with the flow.
+    moving: bool = False  # False: stationary no-slip wall. True: road sliding underneath.
+    # None means "whatever the air is doing", so a speed sweep stays a sweep of
+    # the vehicle rather than of the wind it is driving into.
+    speed: float | None = None
 
     def to_dict(self) -> dict:
-        return {"enabled": self.enabled, "ride_height": self.ride_height, "moving": self.moving}
+        return {
+            "enabled": self.enabled,
+            "ride_height": self.ride_height,
+            "moving": self.moving,
+            "speed": self.speed,
+        }
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "Road":
@@ -183,7 +213,38 @@ class Road:
             enabled=bool(data.get("enabled", True)),
             ride_height=_as_float(data.get("ride_height"), 0.15),
             moving=bool(data.get("moving", False)),
+            speed=_as_optional_float(data.get("speed")),
         )
+
+    def ground_speed(self, wind_vector: np.ndarray) -> float:
+        """How fast the road runs, in m/s, under this free stream.
+
+        Unset tracks the *horizontal* part of the wind: a vehicle driving on
+        flat ground cannot generate a vertical relative wind, so any elevation
+        in the wind is air movement the vehicle is not responsible for.
+        """
+        if self.speed is not None:
+            return float(self.speed)
+        wind = np.asarray(wind_vector, dtype=float)
+        return float(np.hypot(wind[0], wind[1]))
+
+    def velocity(self, wind_vector: np.ndarray) -> np.ndarray:
+        """Velocity of the road surface as the solvers must see it.
+
+        The road runs downstream along the wind's ground heading -- which is
+        what a road aligned with the direction of travel means once the frame
+        is pinned to the vehicle. Zero whenever there is nothing to move: no
+        road, a stationary one, or a wind with no heading to align with.
+        """
+        wind = np.asarray(wind_vector, dtype=float)
+        if not self.enabled or not self.moving:
+            return np.zeros(3)
+        heading = np.array([wind[0], wind[1], 0.0], dtype=float)
+        norm = float(np.linalg.norm(heading))
+        if norm < 1e-12:
+            # A wind straight up or down leaves the road no direction to run in.
+            return np.zeros(3)
+        return heading / norm * self.ground_speed(wind)
 
 
 @dataclass
@@ -331,6 +392,13 @@ class PackagingSettings:
     streamline: bool = True
     nose_angle_deg: float = 45.0
     tail_angle_deg: float = 12.0
+    # "heuristic" builds the envelope at the angles above and stops. "cfd" then
+    # puts the solver in the loop: a budget of screening solves walks the tail
+    # and nose angles to whatever this payload at these conditions actually
+    # wants. Slow -- each step is a real CFD solve -- and worth it exactly when
+    # the rule-of-thumb angles are the thing you doubt.
+    shape_solver: str = "heuristic"  # or "cfd"
+    refine_solves: int = 10
 
     def to_dict(self) -> dict:
         return {
@@ -340,12 +408,17 @@ class PackagingSettings:
             "streamline": self.streamline,
             "nose_angle_deg": self.nose_angle_deg,
             "tail_angle_deg": self.tail_angle_deg,
+            "shape_solver": self.shape_solver,
+            "refine_solves": self.refine_solves,
         }
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "PackagingSettings":
         data = data or {}
         defaults = cls()
+        solver = str(data.get("shape_solver") or defaults.shape_solver)
+        if solver not in ("heuristic", "cfd"):
+            solver = defaults.shape_solver
         return cls(
             clearance=_as_float(data.get("clearance"), defaults.clearance),
             anisotropy=_as_float(data.get("anisotropy"), defaults.anisotropy),
@@ -353,6 +426,8 @@ class PackagingSettings:
             streamline=bool(data.get("streamline", defaults.streamline)),
             nose_angle_deg=_as_float(data.get("nose_angle_deg"), defaults.nose_angle_deg),
             tail_angle_deg=_as_float(data.get("tail_angle_deg"), defaults.tail_angle_deg),
+            shape_solver=solver,
+            refine_solves=max(int(data.get("refine_solves") or defaults.refine_solves), 3),
         )
 
 
@@ -643,6 +718,10 @@ class Scene:
     def ground_offset(self) -> float | None:
         """Ground offset in the convention the OpenFOAM backend expects."""
         return self.road.ride_height if self.road.enabled else None
+
+    def road_velocity(self, speed: float | None = None) -> np.ndarray:
+        """Road surface velocity at this point on the speed curve."""
+        return self.road.velocity(self.wind_vector(speed))
 
     def metrics(self, resolution: int = 512) -> GeometryMetrics:
         return geometry_metrics(self.placed_mesh(), self.wind.direction(), resolution=resolution)

@@ -36,13 +36,26 @@ const CONTROL_SPECS = {
   road: [
     { key: 'enabled', label: 'Road present', type: 'check' },
     { key: 'ride_height', label: 'Ride height', unit: 'm', min: 0, max: 3, step: 0.005, decimals: 3 },
-    { key: 'moving', label: 'Road moves with the flow', type: 'check' },
+    { key: 'moving', label: 'Road moves under the body', type: 'check' },
+    {
+      // Blank is the still-air case and stays the default, so the road speed
+      // is a number you reach for only when air and vehicle disagree.
+      key: 'speed', label: 'Road speed', unit: 'm/s', type: 'number',
+      step: 0.5, decimals: 2, nullable: true, placeholder: 'matches the wind',
+    },
   ],
   fluid: [
     { key: 'density', label: 'Density', unit: 'kg/m³', min: 0.4, max: 2.0, step: 0.001, decimals: 4 },
     { key: 'viscosity', label: 'Viscosity', unit: 'Pa·s', type: 'number', expo: true },
   ],
   packaging: [
+    {
+      key: 'shape_solver', label: 'Shape solver', type: 'select',
+      options: [
+        ['heuristic', 'Heuristic — taper rules, seconds'],
+        ['cfd', 'True loop — CFD in the loop, slow'],
+      ],
+    },
     { key: 'clearance', label: 'Payload clearance', unit: 'm', min: 0.005, max: 0.3, step: 0.005, decimals: 3 },
     { key: 'anisotropy', label: 'Streamwise bias', min: 1, max: 6, step: 0.1, decimals: 1 },
     { key: 'resolution', label: 'Voxel resolution', min: 48, max: 220, step: 4, decimals: 0 },
@@ -73,6 +86,7 @@ const CONTROL_SPECS = {
 const state = {
   runs: [],           // tab-bar summaries
   activeId: null,
+  view: 'run',        // 'run' shows the active run, 'queue' the solver queue
   run: null,          // the full payload of the run on screen
   solvers: [],
   cores: null,
@@ -170,6 +184,44 @@ function el(tag, className, text) {
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+/* ------------------------------------------------------------ click guard */
+
+/* Every button that opens a run goes through here.
+ *
+ * Two separate problems, one fix. A click that starts a request has to *look*
+ * like it landed, or it reads as missed and gets clicked again; and the second
+ * click must not open a second run even so. The button goes busy in the same
+ * frame as the press -- before any await -- and further clicks on the same
+ * action are dropped until the first one comes back.
+ */
+const busy = new Set();
+
+async function guarded(key, button, action) {
+  if (busy.has(key)) return;   // the first click is still working; this is a repeat
+  busy.add(key);
+  if (button) {
+    button.classList.add('is-busy');
+    button.disabled = true;
+  }
+  try {
+    await action();
+  } finally {
+    busy.delete(key);
+    if (button && button.isConnected) {
+      button.classList.remove('is-busy');
+      button.disabled = false;
+    }
+    // The panel buttons have their own rules about being enabled; re-assert
+    // them rather than leaving whatever this handler set.
+    renderActions();
+  }
+}
+
+/* Wire a click through the guard, keyed by the button itself. */
+function onClick(button, key, action) {
+  button.addEventListener('click', () => guarded(key, button, action));
 }
 
 /* ------------------------------------------------------------- viewport */
@@ -568,6 +620,7 @@ function buildControl(section, spec) {
   number.id = `ctl-${section}-${spec.key}`;
   label.htmlFor = number.id;
   if (spec.step !== undefined) number.step = spec.step;
+  if (spec.placeholder) number.placeholder = spec.placeholder;
   row.append(number);
 
   let slider = null;
@@ -588,6 +641,12 @@ function buildControl(section, spec) {
   }
 
   number.addEventListener('change', () => {
+    // A nullable field left blank is a value in its own right -- "unset" --
+    // and has to reach the server as null rather than be dropped as junk.
+    if (spec.nullable && number.value.trim() === '') {
+      pushControl(section, spec.key, null);
+      return;
+    }
     const value = Number(number.value);
     if (Number.isNaN(value)) return;
     if (slider) slider.value = value;
@@ -596,8 +655,13 @@ function buildControl(section, spec) {
 
   return {
     row,
+    nullable: Boolean(spec.nullable),
     apply: (value) => {
       if (document.activeElement === number) return;
+      if (value === null || value === undefined) {
+        number.value = '';
+        return;
+      }
       // Very small quantities such as viscosity are unreadable as decimals.
       number.value = spec.expo
         ? Number(value).toExponential(3)
@@ -627,7 +691,11 @@ function applyControls(scene) {
   for (const [section, controls] of Object.entries(controlRegistry)) {
     const values = scene[section] || {};
     for (const [key, control] of Object.entries(controls)) {
-      if (values[key] !== undefined && values[key] !== null) control.apply(values[key]);
+      if (values[key] === undefined) continue;
+      // Null is "unset" where that is a real state, and stale everywhere else:
+      // a nullable field has to be cleared, or it keeps the last run's number.
+      if (values[key] === null && !control.nullable) continue;
+      control.apply(values[key]);
     }
   }
 }
@@ -720,13 +788,29 @@ function renderTabs() {
   const host = $('tabbar');
   host.textContent = '';
 
+  // The queue is a tab like the runs are, but it is the line itself rather
+  // than a thing in it: pinned first, and with no close button to grow.
+  const queueTab = el('button', 'tab tab-pinned');
+  queueTab.type = 'button';
+  queueTab.title = 'What is on the solver and what waits behind it';
+  if (state.view === 'queue') queueTab.classList.add('is-active');
+  const queueGlyph = el('span', 'glyph');
+  if (state.running) queueGlyph.classList.add('glyph-running');
+  else if (state.queue.length) queueGlyph.classList.add('glyph-queued');
+  else queueGlyph.classList.add('glyph-draft');
+  queueTab.append(queueGlyph, el('span', 'tab-label', 'Queue'));
+  if (state.queue.length) queueTab.append(el('span', 'tab-queue', String(state.queue.length)));
+  queueTab.addEventListener('click', () => showView('queue'));
+  host.append(queueTab);
+
   for (const summary of state.runs) {
     const tab = el('button', 'tab');
     tab.type = 'button';
-    if (summary.id === state.activeId) tab.classList.add('is-active');
+    if (summary.id === state.activeId && state.view === 'run') tab.classList.add('is-active');
     if (summary.kind === 'shape') tab.classList.add('is-shape');
 
-    const position = queuePosition(summary.id);
+    const entry = queueEntry(summary.id);
+    const position = entry?.position ?? null;
     const glyph = el('span', 'glyph');
     if (summary.status === 'running') glyph.classList.add('glyph-running');
     else if (summary.status === 'queued') glyph.classList.add('glyph-queued');
@@ -738,6 +822,7 @@ function renderTabs() {
     tab.append(glyph, el('span', 'tab-label', summary.title));
 
     if (position) tab.append(el('span', 'tab-queue', `#${position}`));
+    else if (entry?.held) tab.append(el('span', 'tab-queue', 'paused'));
 
     if (summary.changed_count) {
       const dot = el('i', 'changed-dot');
@@ -788,6 +873,154 @@ function renderTabs() {
   host.append(note);
 }
 
+/* ------------------------------------------------------------ queue view */
+
+function showView(view) {
+  state.view = view;
+  $('layout-main').hidden = view !== 'run';
+  $('queue-view').hidden = view !== 'queue';
+  renderTabs();
+  if (view === 'queue') renderQueueView();
+}
+
+/* The queue view lists the line in solve order: the run on the machine now,
+   then everything waiting. Waiting runs can be stopped, paused (they keep
+   their place but let others pass) and reordered; the running one only
+   reports, because a solve is never killed under the solver. */
+function renderQueueView() {
+  if (state.view !== 'queue') return;
+  const runningHost = $('queue-running');
+  const listHost = $('queue-list');
+  runningHost.textContent = '';
+  listHost.textContent = '';
+
+  const summaryOf = (runId) => state.runs.find((item) => item.id === runId);
+  const nameButton = (runId, fallback) => {
+    const name = el('button', 'queue-name', summaryOf(runId)?.title || fallback);
+    name.type = 'button';
+    name.title = 'Show this run';
+    name.addEventListener('click', () => selectRun(runId));
+    return name;
+  };
+
+  if (state.running) {
+    const stopping = Boolean(state.running.stopping);
+    const row = el('div', 'queue-row is-running');
+    row.append(
+      el('span', 'queue-pos', 'now'),
+      el('span', 'glyph glyph-running'),
+      nameButton(state.running.run_id, 'Solving…'),
+      el('span', `pill ${stopping ? 'pill-warn' : 'pill-run'}`, stopping ? 'stopping' : 'solving'),
+    );
+    const remaining = state.running.progress?.remaining_text;
+    row.append(el('span', 'queue-sub', stopping
+      ? 'Killing the solver — the next run starts as soon as it lets go.'
+      : `${remaining ? `~${remaining} left` : 'running'}`));
+
+    const actions = el('div', 'queue-actions');
+    const stop = el('button', 'btn queue-btn', stopping ? 'Stopping…' : 'Stop');
+    stop.type = 'button';
+    stop.disabled = stopping;
+    stop.title = 'Kill this solve and hand the machine to the next run. '
+      + 'Its partial results are discarded and its parameters unfreeze.';
+    onClick(stop, 'stop-running', () => stopRunning(state.running.run_id));
+    actions.append(stop);
+    row.append(actions);
+
+    const bar = el('span', 'queue-progress');
+    bar.style.width = `${Math.round((state.running.progress?.fraction ?? 0.04) * 100)}%`;
+    row.append(bar);
+    runningHost.append(row);
+  }
+
+  if (!state.queue.length) {
+    listHost.append(el('div', 'queue-empty', state.running
+      ? 'Nothing waiting behind it.'
+      : 'Nothing queued. Compute drag or derive a shape and the runs line up here.'));
+    return;
+  }
+
+  state.queue.forEach((entry, index) => {
+    const row = el('div', 'queue-row');
+    if (entry.held) row.classList.add('is-held');
+
+    row.append(
+      el('span', 'queue-pos', entry.held ? '· ·' : `#${entry.position}`),
+      el('span', 'glyph glyph-queued'),
+      nameButton(entry.run_id, 'Queued run'),
+    );
+    if (entry.held) row.append(el('span', 'pill pill-draft', 'paused'));
+
+    const actions = el('div', 'queue-actions');
+
+    const up = el('button', 'btn btn-quiet queue-btn', '↑');
+    up.type = 'button';
+    up.title = 'Solve sooner';
+    up.disabled = index === 0;
+    onClick(up, `queue:${entry.run_id}`, () => queueVerb(entry.run_id, 'move', { direction: 'up' }));
+
+    const down = el('button', 'btn btn-quiet queue-btn', '↓');
+    down.type = 'button';
+    down.title = 'Solve later';
+    down.disabled = index === state.queue.length - 1;
+    onClick(down, `queue:${entry.run_id}`,
+      () => queueVerb(entry.run_id, 'move', { direction: 'down' }));
+
+    const pause = el('button', 'btn queue-btn', entry.held ? 'Resume' : 'Pause');
+    pause.type = 'button';
+    pause.title = entry.held
+      ? 'Put it back in the running order'
+      : 'Keep its place in the line but let others pass it';
+    onClick(pause, `queue:${entry.run_id}`,
+      () => queueVerb(entry.run_id, entry.held ? 'release' : 'hold'));
+
+    const stop = el('button', 'btn queue-btn', 'Stop');
+    stop.type = 'button';
+    stop.title = 'Take it out of the queue — its parameters unfreeze';
+    onClick(stop, `queue:${entry.run_id}`, () => cancelRun(entry.run_id));
+
+    actions.append(up, down, pause, stop);
+    row.append(actions);
+    listHost.append(row);
+  });
+}
+
+/* Killing a solve is the one queue action that throws away work, so it asks
+   first -- and the wording says what is lost, since a partial solve leaves no
+   usable numbers behind. */
+async function stopRunning(runId) {
+  const title = state.runs.find((item) => item.id === runId)?.title || 'this run';
+  const message = `Stop ${title}?\n\nThe solver is killed and its partial results are `
+    + 'discarded. Its parameters unfreeze, so you can lower the quality and run it again.';
+  if (!window.confirm(message)) return;
+  try {
+    const payload = await api(`/api/runs/${runId}/stop`, { method: 'POST' });
+    adoptState(payload.state);
+    renderTabs();
+    toast('Stopping the solver — the next queued run starts when it lets go');
+    schedulePoll(300);
+  } catch (error) {
+    toast(error.message, true);
+    pollActivity();
+  }
+}
+
+async function queueVerb(runId, verb, body) {
+  try {
+    adoptState(await api(`/api/runs/${runId}/${verb}`, {
+      method: 'POST',
+      ...(body ? {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      } : {}),
+    }));
+    renderTabs();
+  } catch (error) {
+    toast(error.message, true);
+    pollActivity();  // the queue moved under the click; repaint from the server
+  }
+}
+
 /* --------------------------------------------------------------- solvers */
 
 function renderSolverList() {
@@ -827,6 +1060,48 @@ function renderSolverList() {
       renderActions();
     });
   }
+}
+
+/* The road is the one control whose meaning depends on another: what a road
+   speed *is* only makes sense against the wind it is being driven into, so the
+   hint says the pair out loud rather than leaving the arithmetic to the user. */
+function renderRoadHint() {
+  const hint = $('road-hint');
+  const scene = state.run?.scene;
+  if (!hint || !scene) return;
+  const road = scene.road;
+
+  if (!road.enabled) {
+    hint.textContent = 'No road: the body flies in open air, every wall of the domain a far field.';
+    return;
+  }
+  if (!road.moving) {
+    hint.textContent = 'A standing road is a wind-tunnel floor and grows a boundary layer of its own. '
+      + 'Turn the motion on to drive the body along it instead.';
+    return;
+  }
+
+  const vector = scene.wind.vector || [0, 0, 0];
+  const air = Math.hypot(vector[0], vector[1]);
+  if (air < 1e-9) {
+    hint.textContent = 'The wind is vertical, so the road has no heading to run along and is being '
+      + 'solved as a standing floor.';
+    return;
+  }
+
+  const pinned = road.speed !== null && road.speed !== undefined;
+  if (!pinned) {
+    hint.textContent = `Still air: the road runs at the wind speed, ${air.toFixed(2)} m/s, which is `
+      + 'the speed the body is doing over the ground. It keeps pace across the whole speed curve.';
+    return;
+  }
+
+  const relative = air - road.speed;
+  const wind = Math.abs(relative) < 0.005
+    ? 'still air, the same as leaving the speed blank'
+    : `a ${Math.abs(relative).toFixed(2)} m/s ${relative > 0 ? 'headwind' : 'tailwind'}`;
+  hint.textContent = `${road.speed.toFixed(2)} m/s over the ground into ${air.toFixed(2)} m/s of `
+    + `air: ${wind}. Pinned, so it stays put as the speed curve moves.`;
 }
 
 function renderProcesses() {
@@ -1499,6 +1774,19 @@ function renderShell() {
   fit.classList.add('tile-span');
   host.append(fit);
 
+  if (shell.refinement) {
+    const ref = shell.refinement;
+    const gain = (ref.improvement === null || ref.improvement === undefined)
+      ? null : ref.improvement * 100;
+    const refined = tile('True loop',
+      `tail ${fmt(ref.best.tail_deg, 1)}° · nose ${fmt(ref.best.nose_deg, 1)}°`,
+      null,
+      `measured over ${ref.solves} ${ref.backend} solves`
+        + (gain === null ? '' : ` · Cd·A ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% vs the heuristic angles`));
+    refined.classList.add('tile-span');
+    host.append(refined);
+  }
+
   const note = $('sweep-note');
   if (shell.merge_radius === null || shell.merge_radius === undefined) {
     note.textContent = 'The payload never merged within the grid, so the shell was built at the largest radius available.';
@@ -1673,14 +1961,19 @@ function renderActions() {
   compute.textContent = isRunning
     ? 'Solving…'
     : isQueued ? 'Queued' : isShape ? 'Compute drag on the shell' : 'Compute drag';
+  const cfdLoop = run.scene.packaging?.shape_solver === 'cfd';
   derive.textContent = isRunning && isShape
-    ? 'Building…'
-    : isQueued && isShape ? 'Queued' : isShape ? 'Derive again' : 'Derive a lower-drag shape';
+    ? (cfdLoop ? 'Refining…' : 'Building…')
+    : isQueued && isShape ? 'Queued'
+      : isShape ? (cfdLoop ? 'Derive again + refine' : 'Derive again')
+        : (cfdLoop ? 'Derive + refine with CFD' : 'Derive a lower-drag shape');
 
   // Only *this* run being committed blocks its own buttons. Another run on the
-  // solver does not: pressing compute simply joins the queue.
-  compute.disabled = committed || noBackends || (isShape && !run.shell);
-  derive.disabled = committed;
+  // solver does not: pressing compute simply joins the queue. A request already
+  // in flight blocks it too, or a render landing mid-request would re-enable
+  // the button under the pointer and let the second click through.
+  compute.disabled = committed || noBackends || (isShape && !run.shell) || busy.has('compute');
+  derive.disabled = committed || busy.has('derive');
 
   const blocked = isRunning
     ? 'This run is on the solver. Its parameters are frozen; every other tab stays live.'
@@ -1713,9 +2006,14 @@ function renderActions() {
         `Solves into this run — it has no results to overwrite yet.${queueNote}`;
     }
 
+    const loopNote = cfdLoop
+      ? ` Then flies ~${run.scene.packaging?.refine_solves || 10} screening solves to tune the`
+        + ' tail and nose angles — minutes to an hour, watchable in the log.'
+      : '';
     deriveWhy.textContent = (isShape
       ? 'Re-wraps the same payload with these settings, as a new run.'
-      : 'Wraps this shape in one closed shell, as a new run. This one is kept.') + queueNote;
+      : 'Wraps this shape in one closed shell, as a new run. This one is kept.')
+      + loopNote + queueNote;
   }
 
   if (isQueued) {
@@ -1838,6 +2136,7 @@ function render() {
   renderGeometry();
   renderReynoldsNote();
   renderSolverList();
+  renderRoadHint();
   renderProcesses();
   renderProgress();
   renderResults();
@@ -1904,14 +2203,19 @@ function adoptState(payload) {
   state.running = payload.running ?? null;
   state.queue = payload.queue || [];
   if (payload.active_id) state.activeId = payload.active_id;
+  renderQueueView();  // no-op unless the queue view is the one on screen
 }
 
 function statusOf(runId) {
   return state.runs.find((item) => item.id === runId)?.status;
 }
 
+function queueEntry(runId) {
+  return state.queue.find((item) => item.run_id === runId) || null;
+}
+
 function queuePosition(runId) {
-  return state.queue.find((item) => item.run_id === runId)?.position ?? null;
+  return queueEntry(runId)?.position ?? null;
 }
 
 /* -------------------------------------------------------------- actions */
@@ -1922,6 +2226,9 @@ async function refreshState() {
 }
 
 async function selectRun(runId, options = {}) {
+  // Picking a run brings its view back; a background refresh (keepView) must
+  // not yank someone out of the queue view they are looking at.
+  if (!options.keepView && state.view !== 'run') showView('run');
   if (!runId) {
     state.run = null;
     state.activeId = null;
@@ -1957,6 +2264,7 @@ async function selectRun(runId, options = {}) {
 }
 
 async function openRun(payload) {
+  if (state.view !== 'run') showView('run');
   adoptState(payload.state);
   state.runCache.set(payload.run.id, payload.run);
   state.activeId = payload.run.id;
@@ -1970,7 +2278,7 @@ async function closeRun(runId) {
     const payload = await api(`/api/runs/${runId}`, { method: 'DELETE' });
     state.runCache.delete(runId);
     adoptState(payload);
-    await selectRun(payload.active_id || null);
+    await selectRun(payload.active_id || null, { keepView: true });
   } catch (error) { toast(error.message, true); }
 }
 
@@ -2005,12 +2313,16 @@ async function pollActivity() {
     adoptState(await api('/api/activity'));
     const nowActive = statusOf(state.activeId);
 
-    if (wasActive !== nowActive && (nowActive === 'done' || nowActive === 'failed')) {
+    // 'draft' belongs here too: that is where a stopped run lands, and its
+    // panel has to unfreeze rather than keep showing a solve that is over.
+    const settled = ['done', 'failed', 'draft'].includes(nowActive);
+    if (wasActive !== nowActive && settled) {
       state.runCache.delete(state.activeId);
       state.polling = false;
-      await selectRun(state.activeId, { keepCamera: true });
+      await selectRun(state.activeId, { keepCamera: true, keepView: true });
       const run = state.run;
       if (nowActive === 'failed') toast(run?.error || 'The run failed', true);
+      else if (nowActive === 'draft') toast('Stopped — its parameters are editable again');
       else toast(run?.kind === 'shape' ? 'Shell ready' : 'Run complete');
     } else {
       renderTabs();
@@ -2073,16 +2385,6 @@ async function startDerive() {
   }
 }
 
-async function adoptShell() {
-  const run = state.run;
-  if (!run) return;
-  try {
-    const payload = await api(`/api/runs/${run.id}/adopt`, { method: 'POST' });
-    await openRun(payload);
-    toast(`Opened ${payload.run.title} — compute its drag to cost the shape`);
-  } catch (error) { toast(error.message, true); }
-}
-
 /* -------------------------------------------------------------- library */
 
 async function refreshLibrary() {
@@ -2106,7 +2408,7 @@ async function refreshLibrary() {
       entry.computed ? 'solved' : 'not solved');
 
     const open = el('button', 'btn', 'Open as run');
-    open.addEventListener('click', async () => {
+    onClick(open, `library-open:${entry.name}`, async () => {
       try {
         const loaded = await api('/api/library/open', {
           method: 'POST',
@@ -2128,7 +2430,7 @@ async function refreshLibrary() {
 
 function wire() {
   for (const button of document.querySelectorAll('[data-sample]')) {
-    button.addEventListener('click', async () => {
+    onClick(button, `sample:${button.dataset.sample}`, async () => {
       try {
         await openRun(await api('/api/runs/sample', {
           method: 'POST',
@@ -2140,34 +2442,37 @@ function wire() {
     });
   }
 
-  $('file-stl').addEventListener('change', async (event) => {
+  $('file-stl').addEventListener('change', (event) => {
     const file = event.target.files[0];
+    event.target.value = '';   // cleared now, so picking the same file twice works
     if (!file) return;
     const body = new FormData();
     body.append('file', file);
-    try {
-      await openRun(await api('/api/runs/import', { method: 'POST', body }));
-      toast(`Imported ${file.name} as a new run`);
-    } catch (error) { toast(error.message, true); }
-    event.target.value = '';
+    guarded('import-stl', null, async () => {
+      try {
+        await openRun(await api('/api/runs/import', { method: 'POST', body }));
+        toast(`Imported ${file.name} as a new run`);
+      } catch (error) { toast(error.message, true); }
+    });
   });
 
-  $('file-scene').addEventListener('change', async (event) => {
+  $('file-scene').addEventListener('change', (event) => {
     const file = event.target.files[0];
+    event.target.value = '';
     if (!file) return;
     const body = new FormData();
     body.append('file', file);
-    try {
-      const payload = await api('/api/runs/open', { method: 'POST', body });
-      await openRun(payload);
-      toast(payload.run.results ? 'Opened a solved run' : 'Opened a run, not solved yet');
-    } catch (error) { toast(error.message, true); }
-    event.target.value = '';
+    guarded('open-scene', null, async () => {
+      try {
+        const payload = await api('/api/runs/open', { method: 'POST', body });
+        await openRun(payload);
+        toast(payload.run.results ? 'Opened a solved run' : 'Opened a run, not solved yet');
+      } catch (error) { toast(error.message, true); }
+    });
   });
 
-  $('btn-compute').addEventListener('click', startCompute);
-  $('btn-derive').addEventListener('click', startDerive);
-  $('btn-adopt').addEventListener('click', adoptShell);
+  onClick($('btn-compute'), 'compute', startCompute);
+  onClick($('btn-derive'), 'derive', startDerive);
 
   $('quality-select').addEventListener('change', async (event) => {
     if (!state.run) return;
@@ -2234,7 +2539,7 @@ function wire() {
     if (event.target === $('library-modal')) $('library-modal').hidden = true;
   });
 
-  $('btn-library-save').addEventListener('click', async () => {
+  onClick($('btn-library-save'), 'library-save', async () => {
     if (!state.run) return;
     try {
       const name = $('library-name').value || state.run.title;

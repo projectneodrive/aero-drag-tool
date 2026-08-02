@@ -406,6 +406,7 @@ def write_su2_config(
     turbulent: bool = True,
     iterations: int = 400,
     cfl: float = 5.0,
+    road_velocity: np.ndarray | None = None,
 ) -> Path:
     """Write an incompressible SU2 config for this case."""
     path = Path(path)
@@ -414,6 +415,22 @@ def write_su2_config(
     reynolds = density * speed * reference_length / viscosity
 
     wall_marker = "MARKER_HEATFLUX= ( body, 0.0" + (", ground, 0.0" if ground else "") + " )"
+
+    # A translating road, written the way SU2's own moving-wall cases are: the
+    # ground stays a viscous wall and additionally gets a surface velocity.
+    # Omitted entirely when nothing moves, so a static case is byte-for-byte
+    # what it was before.
+    road = np.zeros(3) if road_velocity is None else np.asarray(road_velocity, dtype=float)
+    road_block = ""
+    if ground and float(np.linalg.norm(road)) > 1e-12:
+        road_block = f"""
+% ---------------- Moving road ----------------
+% The frame is the vehicle's, so the ground runs downstream at the vehicle's
+% speed rather than standing still and growing a boundary layer no road has.
+SURFACE_MOVEMENT= MOVING_WALL
+MARKER_MOVING= ( ground )
+SURFACE_TRANSLATION_RATE= {road[0]:.10g} {road[1]:.10g} {road[2]:.10g}
+"""
 
     solver = "INC_RANS" if turbulent else "INC_NAVIER_STOKES"
     turb_block = "KIND_TURB_MODEL= SST\n" if turbulent else ""
@@ -472,7 +489,7 @@ MARKER_FAR= ( farfield )
 MARKER_MONITORING= ( body )
 MARKER_PLOTTING= ( body )
 MARKER_ANALYZE= ( body )
-
+{road_block}
 % ---------------- Numerics ----------------
 NUM_METHOD_GRAD= WEIGHTED_LEAST_SQUARES
 CONV_NUM_METHOD_FLOW= FDS
@@ -616,6 +633,7 @@ def prepare_su2_case(
     surface_cells: int = 25,
     refinement_level: int = 3,
     reference_area: float | None = None,
+    road_velocity: np.ndarray | None = None,
 ) -> dict:
     """Write a complete, self-contained SU2 case (mesh + config) to disk.
 
@@ -654,6 +672,7 @@ def prepare_su2_case(
         ground=ground,
         turbulent=turbulent,
         iterations=iterations,
+        road_velocity=road_velocity,
     )
 
     return {
@@ -663,6 +682,7 @@ def prepare_su2_case(
         "reference_area": float(reference_area),
         "reference_length": reference_length,
         "ground": ground,
+        "road_speed": float(np.linalg.norm(road_velocity)) if road_velocity is not None else 0.0,
     }
 
 
@@ -677,7 +697,9 @@ def _run_su2_command(case_dir: Path, runner: Runner) -> Path:
         else:
             command = [runner.executable, "case.cfg"]
         with log_path.open("w", encoding="utf-8") as handle:
-            subprocess.run(command, cwd=case_dir, stdout=handle, stderr=subprocess.STDOUT, check=False)
+            execution_env.run_process(
+                command, cwd=case_dir, stdout=handle, stderr=subprocess.STDOUT
+            )
         return log_path
 
     binary = shlex.quote(runner.executable)
@@ -705,6 +727,7 @@ def run_su2_drag(
     refinement_level: int = 3,
     processes: int | None = None,
     reference_area: float | None = None,
+    road_velocity: np.ndarray | None = None,
 ) -> SU2Result:
     runner = detect_su2(processes=processes)
     if runner is None:
@@ -737,6 +760,7 @@ def run_su2_drag(
         surface_cells=surface_cells,
         refinement_level=refinement_level,
         reference_area=reference_area,
+        road_velocity=road_velocity,
     )
 
     log_path = _run_su2_command(case_dir, runner)
@@ -775,6 +799,8 @@ def run_su2_drag(
         settings={
             "turbulence": "SST" if turbulent else "laminar",
             "iterations": iterations,
+            "moving_ground": bool(setup["road_speed"] > 1e-12),
+            "road_speed": float(setup["road_speed"]),
             "surface_cells": surface_cells,
             "cells": setup.get("cell_count"),
             "nodes": setup.get("node_count"),
