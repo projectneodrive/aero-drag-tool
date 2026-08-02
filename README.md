@@ -1,27 +1,240 @@
 # aero-drag-tool
 
 Compute the aerodynamic drag of a shape with two independent CFD solvers and
-compare them, from a browser GUI or from the command line.
+compare them, then derive a lower-drag shape around it — from a browser GUI or
+from the command line.
 
 The point of running two solvers is the cross-check: OpenFOAM and SU2 are given
 the same placed mesh, the same flow domain and the same reference area, so the
 Cd they report can be compared directly. If they disagree, the tool says so.
 
+![A shape run: the imported payload in orange, the single-body shell the tool
+derived around it in blue, with the closing sweep and the shell's measurements
+on the right](docs/images/04-shell.png)
+
+**New to any of this?** [`docs/how-it-works.md`](docs/how-it-works.md) explains
+the whole pipeline — what a CFD solver actually does, how the shape maker
+wraps a payload, how the optimiser searches — in plain language, with the
+reasoning behind every technical choice. No prior aerodynamics assumed.
+
+---
+
+## Install
+
+Two routes. **Docker is recommended**: it pins OpenFOAM 13 and SU2 8.4.0
+rather than inheriting whatever the machine happens to have, nothing lands on
+`PATH`, and the SU2 image is published pre-compiled so you skip a long build.
+
+### Docker (recommended)
+
+Needs Docker — Docker Desktop with the WSL2 backend on Windows, Docker Engine
+on Linux.
+
+```bash
+git clone https://github.com/projectneodrive/aero-drag-tool.git
+cd aero-drag-tool
+
+# The GUI bind-mounts these two, and neither is in git. Create them first, or
+# Docker invents a *directory* where the history file should be and run-time
+# calibration quietly stops working.
+mkdir -p scenes
+[ -f runtime_history.json ] || echo '{"samples": []}' > runtime_history.json
+
+docker compose --profile solvers pull   # web + both solver images, from GHCR
+docker compose up web                   # then open http://127.0.0.1:8000
 ```
+
+On Windows PowerShell those two prep lines are:
+
+```powershell
+New-Item -ItemType Directory -Force scenes | Out-Null
+if (-not (Test-Path runtime_history.json)) { '{"samples": []}' | Out-File -Encoding utf8 runtime_history.json }
+```
+
+That is the whole install. The `web` container serves the GUI and launches the
+solver images as *sibling* containers through the host's Docker socket, so
+there is no second thing to start.
+
+To build the images from the checkout instead — unreleased changes, or no
+registry access — use the twin compose file:
+
+```bash
+docker compose -f docker-compose-local.yml --profile solvers build
+docker compose -f docker-compose-local.yml up web
+```
+
+Expect that to take a while: the SU2 image compiles from source with MPI,
+which is exactly what pulling the published image avoids. See
+[Containers](#containers) for why each image is built the way it is.
+
+### Local Python
+
+Gets you the GUI, all the geometry, and the whole shape maker. Computing drag
+additionally needs at least one solver — see below.
+
+```bash
 python -m pip install -r requirements.txt
-python src/server.py           # opens http://127.0.0.1:8000
+python src/server.py             # opens http://127.0.0.1:8000
 ```
 
-The application lives in `src/`; the repository root holds only the README,
-dependencies, the SU2 install script and the two sample STLs.
+Python 3.10+. The front end is static files with three.js vendored in the
+repo, so there is no node build step.
 
-![The GUI: one tab per run, this run's parameters on the left, the scene in the
-middle, its results on the right](docs/screenshot.png)
+For the solvers, easiest is still to build the two images and let the tool
+find them:
 
-Two samples ship with the tool: `sample.stl` is a unit cube, useful because its
-Cd is known and easy to check; `sample2.stl` is a mock tadpole trike -- a
-reclined rider envelope plus three wheels -- whose four separate bodies are what
-the shape search exists for.
+```bash
+./docker/build.sh                # .\docker\build.ps1 on Windows
+```
+
+Or install them natively: `setup.sh` builds SU2 v8.4.0 (Ubuntu/Pop!_OS
+tested), and OpenFOAM 13 is expected at `/opt/openfoam13` inside WSL
+`Ubuntu-22.04` — adjust `WSL_DISTRO` and `OPENFOAM_BASHRC` at the top of
+[`src/openfoam.py`](src/openfoam.py) if yours lives elsewhere. See
+[Installing the solvers](#installing-the-solvers) for the details and the
+gotchas.
+
+### Check it worked
+
+```bash
+python src/runner.py info
+```
+
+```
+Solver availability:
+
+  [yes] OpenFOAM     foamRun via WSL Ubuntu-22.04, 6 processes
+  [no ] SU2          SU2_CFD not found natively, in Docker or in WSL. Build the image with docker/build.sh.
+
+  cores visible : 8
+  default ranks : 6 (80% of them; override with --processes)
+```
+
+The GUI shows the same thing, live, in the Solve panel: `ready` next to a
+backend it can use, `not here` next to one it cannot, with the reason. You can
+load a shape, inspect its geometry and derive shells with no solver at all —
+only **Compute drag** needs one.
+
+---
+
+## Quickstart: from an STL to a refined shell
+
+Two samples ship with the tool: `sample.stl` is a unit cube, useful because
+its Cd is known and easy to check; `sample2.stl` is a mock tadpole trike — a
+reclined rider envelope plus three wheels — whose separate bodies are what the
+shape search exists for. This walkthrough uses the trike, and every number in
+it is a real measurement from the run pictured.
+
+### 1. Load a shape
+
+**Import STL**, or **Sample trike** to follow along. A new tab opens: that is
+a *run*, and it holds this shape, the conditions you set, and whatever the
+solvers eventually say about it.
+
+![A freshly imported run: the payload on the road with the wind arrow, its
+parameters on the left, its measured geometry on the right](docs/images/01-payload.png)
+
+The right-hand panel is already useful before anything is solved. The frontal
+area is the true silhouette at this wind angle — projected triangles
+rasterised and unioned, so surfaces hiding behind other surfaces are counted
+once — and it updates as you drag the wind or attitude sliders. The yellow
+note is the Reynolds analysis telling you, in advance, whether one solve can
+be scaled across your speed range or whether every speed needs its own.
+
+Set the wind speed, ride height and attitude on the left. Pick a quality
+preset under **Solve**: *screening* to rank designs against each other,
+*balanced* for ordinary work, *accurate* for the design you are keeping.
+
+### 2. Compute its drag — the baseline
+
+Press **Compute drag**. The run's parameters freeze (so the numbers can always
+be traced to the inputs that produced them), a progress bar appears under its
+tab, and every *other* tab stays fully live while the solver grinds.
+
+![The solved baseline: drag force and drag coefficient on separate charts,
+Cd·A in the headline tile](docs/images/03-baseline.png)
+
+```
+   Cd = 0.7793    A = 0.3012 m²    →   Cd·A = 0.2347 m²     (screening)
+```
+
+Drag force and Cd get **separate charts on purpose**: Cd is not constant — it
+moves with Reynolds number — so plotting both on one dual axis would invent a
+relationship that is not in the data. Filled markers are speeds the solver
+actually computed; hollow ones were scaled from a single solve.
+
+### 3. Derive a shape around it
+
+Under **Shape search**, press **Derive a lower-drag shape**. This opens a new
+run that wraps *this* shape in a single closed shell.
+
+That is the screenshot at the top of this README. What it shows:
+
+- The payload (orange) inside the shell (blue), which **encloses** it with the
+  clearance you asked for — checked by ray-casting, not assumed.
+- **Bodies vs closing radius**: the payload starts as 3 separate lumps and
+  becomes one at a closing radius of 67 mm. The tool bisects for that
+  threshold and builds at 71 mm — the smallest radius that holds, because
+  every millimetre past it is frontal area bought for nothing.
+- `BODIES 1`, verified by splitting the built mesh and counting, not by
+  trusting the sweep.
+
+The shape solver dropdown picks how the profile is chosen: **Heuristic** shapes
+it by taper rules in seconds; **True loop** puts the CFD solver inside the
+derivation and measures the nose and tail angles this payload actually wants
+(see [The true loop](#the-true-loop-measuring-the-angles-instead-of-assuming-them)).
+
+### 4. Compute the shell's drag, and compare
+
+Press **Compute drag on the shell**. That opens the shell as its own run and
+solves it, so the shape run stays as it was.
+
+![The shell solved: the headline tile reports drag area with the change
+against the run it came from](docs/images/05-shell-drag.png)
+
+```
+   Cd = 0.6629    A = 0.4747 m²    →   Cd·A = 0.3147 m²     (screening)
+                                            +34.1% vs trike · drag #1
+```
+
+Because the new run knows its parent, the headline is a **change**, and it is
+quoted in **drag area (Cd·A) rather than Cd** — a shape can post a flattering
+coefficient purely by being bigger.
+
+Read that result carefully, because it is the tool working, not failing. The
+shell is a *better shape*: its Cd is 15% below the bare payload's. It is still
+the *worse vehicle*, because merging three separate lumps into one closed body
+means bridging the gaps between them, and every bridge is silhouette that used
+to be open air — **+58% frontal area**, which 15% of Cd does not pay back.
+
+That is the loop's whole purpose: it measured instead of assuming. From here
+you would attack the area (tighter clearance, higher streamwise bias, move the
+payload), or fly the true loop to find out what tail angle this body actually
+wants. Nothing you did earlier is overwritten — each attempt is its own tab.
+
+### The same loop, headless
+
+```bash
+python src/runner.py new  --stl sample2.stl     --ground 0.15 --speed 15 --mode scale -o baseline.aero.json
+python src/runner.py fair --payload sample2.stl --ground 0.15 --speed 15 --mode scale -o shell.aero.json
+python src/runner.py compare baseline.aero.json shell.aero.json   # solves both, ranks them
+```
+
+```
+Ranking by drag area (Cd x A, lower is better):
+
+  scene                              solver          Cd     A m^2   Cd.A m^2
+  baseline.aero.json                 openfoam    0.4071    0.3012    0.12262
+  shell.aero.json                    openfoam    0.4606    0.4747    0.21864
+```
+
+Those are *balanced* quality (the CLI default) against the GUI walkthrough's
+*screening*, which is why every number differs — and why on this pair even the
+Cd ordering flips. Screening is for ranking candidates against each other under
+identical settings, not for absolute numbers; see
+[Quality presets and run time](#quality-presets-and-run-time).
+
+---
 
 ## Runs
 
@@ -58,8 +271,9 @@ There are two verbs, in a bar that spans the run they act on:
 So the loop is: import an STL, compute its drag for a baseline, derive a shape
 around it, open that shell as its own run, compute *its* drag — and because the
 new run knows its parent, the headline number is shown as a change
-(`Cd·A 0.288 m², −16.1% vs trike · drag #1`). That is the number the loop
-exists to move. Repeat as needed; nothing you did earlier is overwritten.
+(`Cd·A 0.3147 m², +34.1% vs trike · drag #1`). That is the number the loop
+exists to move, in either direction: the sign is a measurement, not a promise.
+Repeat as needed; nothing you did earlier is overwritten.
 
 ## The fairing is always a single closed shell
 
@@ -162,9 +376,19 @@ half an hour into the queue.
 
 **Compare by Cd·A, not Cd.** A shape can post a flattering coefficient purely by
 being bigger, since Cd is normalised by the frontal area it is quoted on. On the
-mock trike the shell's Cd is comfortably below the bare payload's and it still
-has to earn that against 60% more frontal area — which is exactly why the delta
-tile reports drag area rather than the coefficient.
+mock trike at screening quality the shell's Cd lands 15% below the bare
+payload's — and it still loses, because bridging three lumps into one body cost
+it 58% more frontal area. That is exactly why the delta tile reports drag area
+rather than the coefficient, and why the loop is worth running rather than
+assuming a fairing pays.
+
+Two further cautions the same measurement makes visible. Between screening and
+balanced quality the *ordering of Cd itself* flips on this pair — a long
+shallow tail is what a coarse mesh resolves worst, so screening flatters it,
+which is why screening is for ranking candidates under identical settings and
+never for a number you quote elsewhere. And the frontal area is the expensive
+axis here: clearance, streamwise bias and how tightly the payload is packed all
+move it, and all of them are cheaper to change than the taper angles.
 
 ## What the GUI does
 
@@ -174,15 +398,24 @@ glance at the bar answers what is open and what it is doing. A solving run keeps
 a progress bar under its label from every tab. Close one with the ×; open a new
 one with **+**, **Import STL** or the **Library**.
 
+![A run on the solver: its parameters locked, a measured ETA, the solver log
+live in the Progress panel, and every other tab still editable](docs/images/02-solving.png)
+
+**The queue.** The solvers want the whole machine, so runs line up rather than
+fight: one solve at a time, with the line itself on a pinned **Queue** tab.
+Anything still waiting can be stopped, paused or reordered; whatever is already
+on the solver has to finish or be killed.
+
 **Scene view.** The shape as loaded from STL, the wind as an arrow arriving from
 upstream, and the road as a plane at z = 0 with a grid at hull-length spacing.
 Orbit with the left mouse button, zoom with the wheel, pan with the right. The
 legend names the shape, so "which one am I looking at" never needs the panel.
 
 **Editing.** Wind speed, azimuth and elevation; yaw, pitch and roll; ride
-height above the road; and the road itself, which can be switched off entirely
-or made to slide at free-stream speed. Air density and viscosity are editable
-too. The frontal area updates as you drag, because it depends on the wind angle.
+height above the road; and the road itself, which can be switched off entirely,
+left standing, or driven along (see below). Air density and viscosity are
+editable too. The frontal area updates as you drag, because it depends on the
+wind angle.
 
 **Results.** Two charts, and Cd gets its own: it is *not* constant, since it
 varies with Reynolds number, so drag force and drag coefficient are plotted on
@@ -200,6 +433,32 @@ it, and the thing that makes editing a solved run safe.
 the results. A run that has not been solved and one that has are the same kind
 of file and open the same way, so you can build a case here, compute it on
 another machine, and open the result back as a run.
+
+## The road, and how fast it is going
+
+A solve happens in the vehicle's frame: the body is held still and the air is
+sent at it. That leaves the road with a choice to make, and it is not cosmetic.
+A road standing still in that frame is a wind-tunnel floor — it grows its own
+boundary layer, thickening all the way to the body, and the flow underneath the
+hull is wrong before it ever arrives. A real road does not do that, because the
+vehicle is the thing that moves.
+
+So a road that is switched on can also be **driven along**, and its speed is the
+vehicle's speed over the ground, applied along the wind's ground heading:
+
+- **Blank (the default)** — the road tracks the wind. This is still air: park the
+  atmosphere, and the speed the body feels is the speed it is doing. It keeps
+  pace across the whole speed curve, so a sweep sweeps the *vehicle*.
+- **A number** — the ground speed, pinned. This is the atmospheric-wind case:
+  25 m/s over the ground into a 5 m/s headwind is a 30 m/s wind over a 25 m/s
+  road, and only the road speed tells the two apart.
+
+Pinning it does mean Cd stops being one number for the whole curve — the road's
+share of the flow changes at every other speed — so the tool says so and points
+you at solving each speed instead.
+
+Both backends implement it: OpenFOAM gets a translating `fixedValue` floor with
+wall functions on it, SU2 a `MARKER_MOVING` ground with `SURFACE_TRANSLATION_RATE`.
 
 ## Frontal area, and why the old number was wrong
 
@@ -294,17 +553,8 @@ prints which one each backend resolved to.
 
 ### Containers
 
-```bash
-./docker/build.sh          # both images; .\docker\build.ps1 on Windows
-python src/runner.py info  # confirm they were picked up
-```
-
-Or run the whole thing as a compose stack, GUI included:
-
-```bash
-docker compose --profile solvers pull   # published images from GHCR, no compile
-docker compose up web                   # then open http://127.0.0.1:8000
-```
+[Install](#docker-recommended) has the commands. This section is why the images
+are built the way they are.
 
 `docker-compose.yml` pulls the images that `.github/workflows/containers.yml`
 publishes on every release tag — which is the point: the SU2 image compiles
@@ -442,10 +692,9 @@ mean, the result is flagged as unconverged.
 
 ## Installing the solvers
 
-**Containers are the recommended route** — `./docker/build.sh` builds both, the
-versions are pinned rather than inherited from whatever the machine happens to
-have, and nothing lands on `PATH`. Requires Docker (Docker Desktop + WSL2 on
-Windows). See [Containers](#containers) above.
+**Containers are the recommended route** — see [Install](#install) for the
+commands. The versions are pinned rather than inherited from whatever the
+machine happens to have, and nothing lands on `PATH`.
 
 The container also makes the offline split practical: design on a laptop, save
 the scene, and run `runner.py run` on a machine that has the images, without a
@@ -485,6 +734,10 @@ directly. The containers do not have this problem: they set `PATH` through
 | `docker-compose.yml` | The stack on published GHCR images; `-local.yml` builds instead |
 | `src/runner.py` | Command line: info / new / run / show / fair / compare / export |
 | `src/drag.py` | SU2-flavoured entry point into the same CLI |
+| `docs/how-it-works.md` | The whole pipeline explained from first principles |
+
+The repository root holds only the README, dependencies, the compose files, the
+SU2 install script and the two sample STLs.
 
 Scene files are format version 2 and older ones are rejected rather than
 migrated; rebuild them from the source STL. There is no compatibility layer,
