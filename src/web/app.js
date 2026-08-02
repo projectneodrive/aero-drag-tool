@@ -62,6 +62,20 @@ const CONTROL_SPECS = {
     { key: 'streamline', label: 'Streamlined envelope', type: 'check' },
     { key: 'nose_angle_deg', label: 'Nose angle', unit: '°', min: 10, max: 80, step: 1, decimals: 0 },
     { key: 'tail_angle_deg', label: 'Tail angle', unit: '°', min: 5, max: 45, step: 1, decimals: 0 },
+    {
+      // Where the tapers meet the payload's own widest section. Faceted is the
+      // minimal envelope and leaves a crease there; blended rounds it. Frontal
+      // area is identical either way, so the choice is wetted area against
+      // separation -- exactly the kind of question to hand to the solver.
+      key: 'envelope_profile', label: 'Shoulders', type: 'select',
+      options: [
+        ['faceted', 'Faceted — flat panels, sharp shoulder'],
+        ['blended', 'Blended — rounded shoulder'],
+      ],
+    },
+    {
+      key: 'shoulder_blend', label: 'Shoulder blend', min: 0, max: 1.5, step: 0.05, decimals: 2,
+    },
   ],
   solver: [
     { key: 'reference_speed', label: 'Reference speed', unit: 'm/s', min: 1, max: 60, step: 0.5, decimals: 2 },
@@ -1774,15 +1788,32 @@ function renderShell() {
   fit.classList.add('tile-span');
   host.append(fit);
 
+  if (shell.streamlined) {
+    // The wetted area is the price of a blended shoulder, and the frontal
+    // area above is what it deliberately does not touch, so the two read
+    // together as the whole of the trade.
+    const blended = shell.shoulder_blend > 0;
+    host.append(tile('Shoulders',
+      blended ? 'blended' : 'faceted',
+      null,
+      blended
+        ? `rounded over ${fmt(shell.shoulder_blend, 2)} half-widths · `
+          + `wetted ${fmt(shell.wetted_area, 2)} m²`
+        : `flat panels, creased at the shoulder · wetted ${fmt(shell.wetted_area, 2)} m²`));
+  }
+
   if (shell.refinement) {
     const ref = shell.refinement;
     const gain = (ref.improvement === null || ref.improvement === undefined)
       ? null : ref.improvement * 100;
+    const searchedBlend = ref.blend_bracket !== null && ref.blend_bracket !== undefined;
     const refined = tile('True loop',
-      `tail ${fmt(ref.best.tail_deg, 1)}° · nose ${fmt(ref.best.nose_deg, 1)}°`,
+      `tail ${fmt(ref.best.tail_deg, 1)}° · nose ${fmt(ref.best.nose_deg, 1)}°`
+        + (searchedBlend ? ` · blend ${fmt(ref.best.blend, 2)}` : ''),
       null,
       `measured over ${ref.solves} ${ref.backend} solves`
-        + (gain === null ? '' : ` · Cd·A ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% vs the heuristic angles`));
+        + (gain === null ? '' : ` · Cd·A ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% vs the heuristic angles`)
+        + (searchedBlend && ref.best.blend <= 0 ? ' · the crease measured no worse than any fillet' : ''));
     refined.classList.add('tile-span');
     host.append(refined);
   }
@@ -2008,7 +2039,9 @@ function renderActions() {
 
     const loopNote = cfdLoop
       ? ` Then flies ~${run.scene.packaging?.refine_solves || 10} screening solves to tune the`
-        + ' tail and nose angles — minutes to an hour, watchable in the log.'
+        + ' tail and nose angles'
+        + (run.scene.packaging?.envelope_profile === 'blended' ? ' and the shoulder blend' : '')
+        + ' — minutes to an hour, watchable in the log.'
       : '';
     deriveWhy.textContent = (isShape
       ? 'Re-wraps the same payload with these settings, as a new run.'

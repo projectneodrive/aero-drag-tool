@@ -670,8 +670,99 @@ The shell is the union of all those cones.
                              the outline is the upper envelope
 ```
 
-A cube goes in, a teardrop with fineness ratio ~3.7 comes out, frontal area
+A cube goes in, a body of fineness ratio ~3.7 comes out, frontal area
 unchanged, and the tail length is set by the 12° limit rather than by taste.
+
+#### Why the shoulders come out sharp
+
+It is not a teardrop, and the diagram above is drawn honestly: there is a
+**corner** where each cone meets the payload's own section. Measured on the
+sample cube at 30 mm clearance, the profile is
+
+```
+   45° cone   │  flat, 1.06 m  │      12° cone
+  ───────────╱│                │╲──────────────────────
+             ↑                 ↑
+        crease here       crease here
+   half-height goes 45°→0° in   and 0°→12° in one slice
+```
+
+and the transition takes about 90 mm out of a 3.94 m body — a knife edge at
+body scale. The cross-sections are *squares* too (the level set of a distance
+field inside a square is a smaller square), so the tail is a square pyramid
+with four flat triangular faces, not a cone of revolution.
+
+This is not a bug in the smoothing. It follows directly from the word
+**minimal**:
+
+- Minimality forces the envelope to equal the payload's own section right up
+  to the trailing face — carrying any more section than that, anywhere, is by
+  definition not the smallest body containing the payload.
+- One voxel further downstream it is already shrinking at exactly tan(12°),
+  because that is the fastest it is allowed to shrink and it has no reason to
+  shrink slower.
+
+So the surface tangent jumps from 0° to 12° across a single slice. A smooth
+shoulder would need the body to start narrowing *before* the payload ends, or
+to hold extra section *after* it — both mean deliberately carrying volume the
+payload does not force, which is precisely the thing the minimal envelope is
+defined to refuse. **Minimality and tangent continuity are in direct
+conflict**, and this stage picks minimality.
+
+The two smoothing passes cannot rescue it, by design:
+
+- The Gaussian on the distance field is chosen to *preserve linear fields
+  exactly* (§3.6), which is what stops it moving flat and gently curved
+  regions. A crease is exactly where two linear pieces meet, so it is rounded
+  only over about one voxel.
+- Taubin on the mesh is local to a few triangle widths, and its whole point is
+  not to shrink the surface into the clearance.
+
+#### So why keep it? (You mostly shouldn't)
+
+Because minimum *volume* was never the objective. The tool ranks on Cd·A, and
+the frontal area that normalises is set by the payload's widest section — the
+envelope cannot beat it and does not try. Minimality is therefore an
+assumption the shape stage inherited, not a criterion anything downstream
+asked for, and a crease at the shoulder is the price it charges for it.
+
+So the shoulder treatment is a **profile setting**, not a fixed property:
+
+| | |
+|---|---|
+| **Faceted** | the minimal envelope — flat panels, creased shoulders. Shortest and smallest body that satisfies the taper limits. |
+| **Blended** | the shoulders rounded over a blend length, tangent-continuous into both the flat and the taper. |
+
+Blended costs wetted area and length and buys tangent continuity. Which wins
+is a real question with a real answer, so it is put to the solver: the true
+loop searches the blend length as a third parameter alongside the two angles,
+and its bracket reaches down to zero — so a blended search *contains* the
+faceted shape and can hand it back if the fillet does not pay.
+
+> **How the fillet is computed.** A blended shoulder is an arc tangent to the
+> flat at one end and to the taper at the other. The trick that makes it
+> nearly free: **a concave curve is the infimum of its own tangent lines**, and
+> each tangent line is just *a straight taper with an outward offset* — which
+> the running-max recursion above already computes exactly. So the fillet is
+> the lower envelope of eight tangent tapers, needs no new machinery, and the
+> panels it produces are what a real fairing is made of anyway. Two properties
+> fall out for free and both are verified in the code: every tangent envelope
+> is at least the bare-taper one, so **containment survives**; and the family
+> includes the flat tangent, so the blend can never exceed the payload's own
+> widest section and **the frontal area does not move**. The fillet is bought
+> in wetted area, never in silhouette.
+> ([`fairing.shoulder_tangents`](../src/fairing.py))
+
+Measured on the sample cube at 30 mm clearance, tail 12°, nose 45°:
+
+| Blend | Frontal area | Volume | Length |
+|---|---|---|---|
+| 0.00 (faceted) | 1.1312 m² | 2.358 m³ | 3.95 m |
+| 0.60 (blended) | 1.1310 m² | 2.906 m³ | 4.35 m |
+
+Frontal area holds to 0.02% — voxelisation noise, not a real change — while
+the volume the fillet costs is plainly visible. That is the trade in one
+table, and the reason the loop is the thing that should settle it.
 
 > **How it's computed exactly.** The obvious way — erode the shape by a
 > sliver, slice by slice — fails, because tan(12°) × 16 mm is 3.4 mm, a fifth
@@ -1003,7 +1094,7 @@ it *measured* instead of assuming. Where do you go from here?
 | "It decided to solve every speed" | It computed Reynolds number at both ends of your speed range and checked whether that interval overlaps a known band |
 | "It wrapped my payload automatically" | Voxel grid, puff up by r, shrink back by r, count the separate pieces, play higher-or-lower on r until the count hits 1 |
 | "It knew how much to smooth" | Bisection on a staircase function that is guaranteed monotone, so there is exactly one threshold to find |
-| "It made a streamlined teardrop" | Every cross-section casts a 45° cone forward and a 12° cone back; the shell is the union |
+| "It made a streamlined teardrop" | Every cross-section casts a 45° cone forward and a 12° cone back; the shell is the union — cones, so the shoulders are creases, not fillets |
 | "It optimised the shape with CFD" | It walked two numbers (nose angle, tail angle) with golden-section search, ~10 solves, keeping the best — including the starting point, so it can't lose |
 | "It knows how long it will take" | Cells × iterations × a rate constant it fitted to your own machine's past solves, stored in `runtime_history.json` |
 | "It verified the shell is one body" | It literally split the mesh and counted, then rebuilt at a bigger radius if the count was wrong |

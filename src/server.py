@@ -1083,6 +1083,7 @@ def derive_shape(run_id: str) -> dict:
                 anisotropy=packaging.anisotropy,
                 streamline=streamline,
                 clearance=packaging.clearance,
+                shoulder_blend=packaging.blend,
             )
             shell = fairing_module.build_single_shell(
                 coarse,
@@ -1093,6 +1094,7 @@ def derive_shape(run_id: str) -> dict:
                 progress=job.add_event,
                 build_grid_override=fine,
                 streamline=streamline,
+                shoulder_blend=packaging.blend,
             )
 
             refinement = None
@@ -1113,6 +1115,12 @@ def derive_shape(run_id: str) -> dict:
                 shell = refinement.shell
 
             warnings = list(coarse.warnings) + list(fine.warnings)
+            if refinement is not None:
+                for note in refinement.at_bracket_edge:
+                    warnings.append(
+                        f"The loop's best shell has {note}, so the optimum may lie past it. "
+                        "Set that value nearer the edge and derive again to search further."
+                    )
             if shell.bodies > 1:
                 warnings.append(
                     f"The shell still came out as {shell.bodies} separate bodies at the largest "
@@ -1148,6 +1156,8 @@ def derive_shape(run_id: str) -> dict:
                 streamlined=shell.streamlined,
                 nose_angle_deg=shell.nose_angle_deg,
                 tail_angle_deg=shell.tail_angle_deg,
+                envelope_profile=packaging.envelope_profile,
+                shoulder_blend=shell.shoulder_blend,
             )
             # The loop measured the angles rather than assuming them; write
             # what it found back into the run's own knobs, so deriving again
@@ -1161,6 +1171,10 @@ def derive_shape(run_id: str) -> dict:
                 if run.solved_params is not None:
                     run.solved_params["packaging.nose_angle_deg"] = refinement.best.nose_deg
                     run.solved_params["packaging.tail_angle_deg"] = refinement.best.tail_deg
+                if run.scene.packaging.envelope_profile == "blended":
+                    run.scene.packaging.shoulder_blend = refinement.best.blend
+                    if run.solved_params is not None:
+                        run.solved_params["packaging.shoulder_blend"] = refinement.best.blend
             run.status = "done"
             run.solved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             run.duration_s = time.time() - started

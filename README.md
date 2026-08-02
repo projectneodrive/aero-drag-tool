@@ -348,6 +348,51 @@ not decided here: solve the shell and compare its Cd·A against the payload's.
 Tweak the angles or disable the stage entirely (`--no-streamline`, or the
 checkbox in the GUI's shape search) to see the difference in numbers.
 
+### Faceted or blended shoulders
+
+Being *minimal* has a consequence worth knowing about: the envelope holds full
+section right up to the payload's last slice, and one slice later it is
+already shrinking at the full taper. The surface tangent jumps from 0° to the
+taper angle in a single step, so **each shoulder is a crease, not a fillet**.
+On the sample cube the profile is a 45° square pyramid, a 1.06 m flat prism,
+and a 12° square pyramid, with a knife edge at each join.
+
+That is not a smoothing failure — the field Gaussian is chosen to preserve
+linear fields exactly, and a crease is precisely where two linear pieces meet.
+It follows from minimality, and minimality is in direct conflict with tangent
+continuity: a smooth shoulder must carry section the payload does not force.
+
+But **minimum volume was never the objective**. The tool ranks on Cd·A, and the
+frontal area is set by the payload's widest section either way. So the shoulder
+is a choice rather than a property:
+
+| Profile | What it is |
+|---|---|
+| **Faceted** | the minimal envelope — flat panels, creased shoulders, shortest body |
+| **Blended** | shoulders rounded over a blend length, tangent-continuous into the flat and into the taper |
+
+Blended costs wetted area and length. It does **not** cost frontal area — the
+construction is bounded by the payload's own widest section, so the silhouette
+is identical and only the wetted area moves. On the sample cube a 0.6 blend
+holds the frontal area to within 0.02% while adding 23% volume.
+
+Which one is faster is a genuine question, so it is put to the solver rather
+than assumed: the true loop searches the blend as a third parameter, and its
+range reaches down to zero, so a blended search contains the faceted shape and
+returns it if the fillet does not pay.
+
+```bash
+python src/runner.py fair --payload sample2.stl --profile blended --shoulder-blend 0.5
+```
+
+In the GUI it is the **Shoulders** dropdown and the **Shoulder blend** slider
+under Shape search. The blend is quoted as a fraction of the payload's
+cross-flow half-width, so the same number means the same shape at any scale.
+It is a *length*, not a fillet radius, deliberately: an arc of radius r turning
+through the taper angle spans only `r·sin(angle)` along the flow, so a radius
+that visibly softens a 45° nose is invisible on a 12° tail, while a length
+blends both over comparable distances.
+
 ### The true loop: measuring the angles instead of assuming them
 
 The heuristic's 12°/45° are right *in general*; they are not right for this
@@ -355,15 +400,34 @@ payload at this Reynolds number. The **shape solver** menu in the shape search
 offers the honest alternative: **True loop** puts the CFD solver inside the
 derivation. The heuristic shell is built first and flown as the baseline, then
 the loop walks the tail angle and the nose angle by golden-section search —
-tail first, because it dominates the trade — building a real shell at each
+tail first, because it dominates the trade, then the nose, then the tail again
+around the measured nose if the budget allows — building a real shell at each
 step, solving it at screening quality with one backend, and reading Cd·A.
+
+**Each candidate is rebuilt from the original payload**, never from the
+heuristic shell. The angles are inputs to the envelope generator, not edits to
+a mesh, so containment is re-established from scratch every step rather than
+inherited from a shape being changed underneath it — and a candidate that
+somehow fails the containment check is ranked behind every real number instead
+of being allowed to win on a flattering Cd·A.
+
+**The search brackets straddle the angles it started from**, so the loop is
+free to lengthen the shell and to shorten it. On the defaults that is a tail
+of 6–22° around the heuristic's 12° and a nose of 25–72° around its 45°; set a
+25° tail by hand and the bracket moves with it (12–45°) rather than leaving
+the starting shape outside its own search range, where every candidate flown
+would be on one side of it. If the winner lands on a bracket edge the run says
+so — that is the search hitting a bound, not finding a minimum.
 
 What makes this affordable is *what* it optimises. Free-form shape
 optimisation needs adjoint gradients and hundreds of solves; this walks the
 envelope generator's own two parameters, where every candidate contains the
 payload by construction, no solve is wasted on an infeasible shape, and a
 budget of ~10 solves (settable as `refine_solves`) lands within a degree or
-two of the optimum. Expect minutes to an hour, watchable line by line in the
+two of the optimum. The budget is split rather than pooled — the tail searches
+first and widest, but the nose keeps a reserved share, so a tight budget
+cannot spend the lot on the tail and hand back an unexamined nose angle as if
+it had been measured. Expect minutes to an hour, watchable line by line in the
 progress log with a measured ETA from the first solve onward.
 
 The result is the argmin over everything flown — baseline included, so the
@@ -373,6 +437,9 @@ them), recorded in the shell panel with the gain over the heuristic, and the
 whole evaluation history is kept in the run file. It needs a live CFD
 backend, which is checked when you press the button rather than discovered
 half an hour into the queue.
+
+With the blended profile selected the loop searches a **third** parameter, the
+shoulder blend, after the two angles — see below.
 
 **Compare by Cd·A, not Cd.** A shape can post a flattering coefficient purely by
 being bigger, since Cd is normalised by the frontal area it is quoted on. On the

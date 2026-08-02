@@ -392,6 +392,17 @@ class PackagingSettings:
     streamline: bool = True
     nose_angle_deg: float = 45.0
     tail_angle_deg: float = 12.0
+    # How the tapers meet the payload's own section. "faceted" is the minimal
+    # envelope: flat panels, and a crease at each shoulder because the section
+    # is held to the last slice and shrinking at full rate the next. Minimum
+    # volume was never the objective though -- Cd.A is, and the frontal area
+    # it normalises on is identical either way -- so "blended" rounds those
+    # shoulders instead, buying tangent continuity with wetted area and
+    # length. Both are worth flying; the loop can search between them.
+    envelope_profile: str = "faceted"  # or "blended"
+    # Streamwise length of each blended shoulder, as a fraction of the
+    # payload's cross-flow half-width. Ignored when faceted.
+    shoulder_blend: float = 0.5
     # "heuristic" builds the envelope at the angles above and stops. "cfd" then
     # puts the solver in the loop: a budget of screening solves walks the tail
     # and nose angles to whatever this payload at these conditions actually
@@ -408,9 +419,20 @@ class PackagingSettings:
             "streamline": self.streamline,
             "nose_angle_deg": self.nose_angle_deg,
             "tail_angle_deg": self.tail_angle_deg,
+            "envelope_profile": self.envelope_profile,
+            "shoulder_blend": self.shoulder_blend,
             "shape_solver": self.shape_solver,
             "refine_solves": self.refine_solves,
         }
+
+    @property
+    def blend(self) -> float:
+        """The blend length actually in force, zero when faceted.
+
+        One accessor rather than a `profile == "blended"` test at every call
+        site, so the two settings can never disagree about what was built.
+        """
+        return self.shoulder_blend if self.envelope_profile == "blended" else 0.0
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "PackagingSettings":
@@ -419,6 +441,9 @@ class PackagingSettings:
         solver = str(data.get("shape_solver") or defaults.shape_solver)
         if solver not in ("heuristic", "cfd"):
             solver = defaults.shape_solver
+        profile = str(data.get("envelope_profile") or defaults.envelope_profile)
+        if profile not in ("faceted", "blended"):
+            profile = defaults.envelope_profile
         return cls(
             clearance=_as_float(data.get("clearance"), defaults.clearance),
             anisotropy=_as_float(data.get("anisotropy"), defaults.anisotropy),
@@ -426,6 +451,8 @@ class PackagingSettings:
             streamline=bool(data.get("streamline", defaults.streamline)),
             nose_angle_deg=_as_float(data.get("nose_angle_deg"), defaults.nose_angle_deg),
             tail_angle_deg=_as_float(data.get("tail_angle_deg"), defaults.tail_angle_deg),
+            envelope_profile=profile,
+            shoulder_blend=_as_float(data.get("shoulder_blend"), defaults.shoulder_blend),
             shape_solver=solver,
             refine_solves=max(int(data.get("refine_solves") or defaults.refine_solves), 3),
         )
@@ -445,6 +472,8 @@ class FairingSpec:
     streamlined: bool = False
     nose_angle_deg: float | None = None
     tail_angle_deg: float | None = None
+    envelope_profile: str = "faceted"
+    shoulder_blend: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -458,6 +487,8 @@ class FairingSpec:
             "streamlined": self.streamlined,
             "nose_angle_deg": self.nose_angle_deg,
             "tail_angle_deg": self.tail_angle_deg,
+            "envelope_profile": self.envelope_profile,
+            "shoulder_blend": self.shoulder_blend,
         }
 
     @classmethod
@@ -477,6 +508,8 @@ class FairingSpec:
             else float(data["nose_angle_deg"]),
             tail_angle_deg=None if data.get("tail_angle_deg") is None
             else float(data["tail_angle_deg"]),
+            envelope_profile=str(data.get("envelope_profile") or "faceted"),
+            shoulder_blend=_as_float(data.get("shoulder_blend"), 0.0),
         )
 
 
