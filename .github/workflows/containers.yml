@@ -1,4 +1,4 @@
-# Build the three images and publish them to GHCR on every release tag.
+# Build the images and publish them to GHCR on every release tag.
 #
 # Release-driven on purpose: the solver Dockerfiles pin their versions
 # (OpenFOAM 13, SU2 8.4.0), so rebuilding them per commit would burn an hour
@@ -7,9 +7,29 @@
 # images should refresh. workflow_dispatch covers the in-between case of a
 # changed Dockerfile that needs publishing without a release.
 #
-# No build cache, also on purpose: releases are rare, and SU2's build-stage
-# cache runs to gigabytes -- slower to ship in and out of the cache backend
-# than the rebuild it would save.
+# Only what changed, though. The solver images are tagged by *solver* version
+# -- `su2:8.4.0`, `openfoam:13` -- not by release, so rebuilding an unchanged
+# Dockerfile republishes a functionally identical image to the same tag: an
+# hour of CI to land back where it started. v0.2.0, v0.2.1 and v0.2.2 each
+# recompiled an SU2 whose Dockerfile had not been touched since before any of
+# them. So a solver image builds only when
+#
+#   * its Dockerfile changed since the previous release tag, or
+#   * its tag is missing from the registry (first publish, or a deleted tag), or
+#   * a manual run asked for it.
+#
+# Neither solver Dockerfile copies anything from the build context, so the
+# Dockerfile *is* the input as far as git can see. What git cannot see is the
+# upstream `ubuntu:24.04` and the SU2 git tag the build clones -- if either
+# moves under a fixed Dockerfile, force a rebuild by hand. That is what the
+# workflow_dispatch input is for.
+#
+# The web image always builds: its context is the whole repository and its tag
+# carries the release number, so there is never nothing to do.
+#
+# No build cache, still on purpose: SU2's build-stage cache runs to gigabytes,
+# slower to ship in and out of the cache backend than the rebuild it would
+# save. Skipping the build outright beats caching it.
 #
 # linux/amd64 only. The SU2 compile under qemu emulation would take the
 # better part of a day, and the solvers are CPU-bound tools nobody has asked
@@ -21,33 +41,106 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Rebuild every image, including unchanged solver images"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
   packages: write
 
 jobs:
+  # Which images actually need building. Split into its own job so the answer
+  # is visible in the run summary rather than buried in a skipped step.
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.check.outputs.matrix }}
+    steps:
+      # Full history and tags: the check compares this release against the one
+      # before it, which a shallow clone cannot see.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Logged in so `docker manifest inspect` can ask GHCR whether a tag is
+      # already published.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: check
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+          base="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          # The tag before this one, along this history. Empty on a manual run
+          # or a first release, which both fall through to building.
+          previous=""
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            previous="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          fi
+          echo "Release: ${GITHUB_REF_NAME}    previous: ${previous:-<none>}"
+          echo
+
+          # Exit 0 to build, 1 to keep what is already published.
+          decide() {
+            local name="$1" tag="$2" path="$3"
+            if [ "${FORCE}" = "true" ]; then
+              echo "  ${name}: rebuilding, the manual run asked for it"
+              return 0
+            fi
+            if ! docker manifest inspect "${base}/${name}:${tag}" >/dev/null 2>&1; then
+              echo "  ${name}: building, ${tag} is not published yet"
+              return 0
+            fi
+            if [ -z "${previous}" ]; then
+              echo "  ${name}: building, no previous release tag to compare against"
+              return 0
+            fi
+            if ! git diff --quiet "${previous}" HEAD -- "${path}"; then
+              echo "  ${name}: rebuilding, ${path} changed since ${previous}"
+              return 0
+            fi
+            echo "  ${name}: SKIPPED, ${path} unchanged since ${previous} and ${tag} is published"
+            return 1
+          }
+
+          entries=()
+          add() {
+            entries+=("{\"image\":\"$1\",\"dockerfile\":\"$2\",\"context\":\"$3\",\"version\":\"$4\"}")
+          }
+
+          if decide openfoam 13 docker/Dockerfile.openfoam; then
+            add openfoam docker/Dockerfile.openfoam docker 13
+          fi
+          if decide su2 8.4.0 docker/Dockerfile.su2; then
+            add su2 docker/Dockerfile.su2 docker 8.4.0
+          fi
+          echo "  web: building, its context is the repository and its tag is the release"
+          add web docker/Dockerfile.web . latest
+
+          matrix="[$(IFS=,; echo "${entries[*]}")]"
+          echo
+          echo "matrix=${matrix}"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: decide
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Tags must match what the tool launches: execution.OPENFOAM_IMAGE
-          # and execution.SU2_IMAGE name the version, the web image tracks
-          # releases. docker-compose.yml points AERO_*_IMAGE at these names.
-          - image: openfoam
-            dockerfile: docker/Dockerfile.openfoam
-            context: docker
-            version: "13"
-          - image: su2
-            dockerfile: docker/Dockerfile.su2
-            context: docker
-            version: "8.4.0"
-          - image: web
-            dockerfile: docker/Dockerfile.web
-            context: .
-            version: latest
+        # Tags must match what the tool launches: execution.OPENFOAM_IMAGE
+        # and execution.SU2_IMAGE name the version, the web image tracks
+        # releases. docker-compose.yml points AERO_*_IMAGE at these names.
+        include: ${{ fromJSON(needs.decide.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
