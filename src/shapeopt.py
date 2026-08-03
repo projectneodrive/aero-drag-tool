@@ -197,6 +197,10 @@ class RefineResult:
     # The search's winner lost at the finer mesh, so the heuristic shell was
     # kept. Not a failure -- the loop doing exactly what it promises.
     reverted_to_baseline: bool = False
+    # The shell that was actually handed back, measured at the run's own
+    # quality: Cd, frontal area, Cd.A. This is a real solve of the real shell,
+    # so the caller can show the achieved drag without asking for it again.
+    delivered_point: dict | None = None
 
     @property
     def improvement(self) -> float | None:
@@ -254,6 +258,7 @@ class RefineResult:
             "confirmed_baseline": self.confirmed_baseline,
             "reverted_to_baseline": self.reverted_to_baseline,
             "rejected_margin": self.rejected_margin,
+            "delivered_point": self.delivered_point,
         }
 
 
@@ -526,24 +531,44 @@ def refine_envelope(
         # away from whatever broke the mesher instead of chasing it.
         return evaluation.drag_area if evaluation.drag_area is not None else float("inf")
 
-    def _confirm(shell: fairing.Shell, what: str) -> float | None:
-        """Cd.A for one shell at the run's own quality, outside the budget.
+    def _confirm(shell: fairing.Shell, what: str) -> dict | None:
+        """Measure one shell at the run's own quality, outside the budget.
 
         Deliberately not charged to ``max_solves``: that budget buys search,
         and this is the check on what the search returned. Charging it would
         make a tighter budget silently drop the check.
+
+        Returns the whole point rather than just Cd.A, because this *is* a
+        real measurement of a real shell at the quality the run is read at --
+        the same solve the user would otherwise run by hand afterwards.
+        Throwing away Cd and the area only to re-derive them later would be
+        asking the solver the same question twice.
         """
         execution.checkpoint()
         trial = _trial_scene(scene, shell.mesh, backend, final_quality)
         try:
-            drag_area, _, _, message, _ = _drag_area(solve(trial, backends=[backend]))
+            drag_area, cd, area, message, converged = _drag_area(
+                solve(trial, backends=[backend])
+            )
         except Exception as error:
-            drag_area, message = None, f"{type(error).__name__}: {error}"
+            drag_area, cd, area, converged = None, None, None, False
+            message = f"{type(error).__name__}: {error}"
         if drag_area is None:
             emit(f"Confirmation solve for {what} failed: {message}")
-        else:
-            emit(f"Confirmation: {what} is Cd·A {drag_area:.4f} m² at {final_quality}.")
-        return drag_area
+            return None
+        emit(
+            f"Confirmation: {what} is Cd·A {drag_area:.4f} m² "
+            f"(Cd {cd:.4f}, A {area:.4f} m²) at {final_quality}."
+            + ("" if converged else " Unconverged.")
+        )
+        return {
+            "drag_area": drag_area,
+            "drag_coefficient": cd,
+            "frontal_area": area,
+            "converged": converged,
+            "quality": final_quality,
+            "backend": backend,
+        }
 
     def golden_section(low: float, high: float, run_eval, min_width: float, cap: int) -> None:
         """Shrink [low, high] around the minimum until the bracket is tight.
@@ -708,6 +733,7 @@ def refine_envelope(
     # therefore only worth stating if it is checked at the quality it will be
     # read at. Two solves buy that, and the fallback makes the promise true
     # rather than merely intended.
+    best_point = baseline_point = delivered = None
     confirmed_best = confirmed_baseline = None
     reverted = False
     changed = (best.nose_deg, best.tail_deg, best.blend) != (
@@ -719,11 +745,15 @@ def refine_envelope(
             f"{search_quality}, and a coarser mesh need not order a long tail "
             "the same way a finer one does. Two solves."
         )
-        confirmed_best = _confirm(shell, "the loop's shell")
-        confirmed_baseline = _confirm(baseline_shell, "the heuristic shell")
+        best_point = _confirm(shell, "the loop's shell")
+        baseline_point = _confirm(baseline_shell, "the heuristic shell")
+        confirmed_best = best_point["drag_area"] if best_point else None
+        confirmed_baseline = baseline_point["drag_area"] if baseline_point else None
+        delivered = best_point
         if confirmed_best is not None and confirmed_baseline is not None:
             delta = (confirmed_best - confirmed_baseline) / confirmed_baseline
             if confirmed_best > confirmed_baseline:
+                delivered = baseline_point
                 reverted = True
                 shell = baseline_shell
                 best = baseline
@@ -786,6 +816,7 @@ def refine_envelope(
         confirmed_best=confirmed_best,
         confirmed_baseline=confirmed_baseline,
         reverted_to_baseline=reverted,
+        delivered_point=delivered,
     )
     gain = result.improvement
     # Quote one mesh per sentence. Mixing the search's Cd.A with a confirmed

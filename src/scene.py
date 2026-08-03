@@ -419,6 +419,13 @@ class PackagingSettings:
     # really wins; set this to that quality to search there directly instead,
     # which is slower and removes the proxy altogether.
     refine_quality: str = "screening"
+    # Solve the finished shell once, at the run's own quality, as part of the
+    # derive. Deriving a shape and not knowing its drag is the gap this tool
+    # exists to close, and a shape panel showing geometry beside no number at
+    # all invites exactly the assumption the tool is meant to replace. Costs
+    # one solve; the true loop's confirmation already is that solve, so the
+    # loop path reuses it rather than paying twice.
+    measure_shell: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -433,6 +440,7 @@ class PackagingSettings:
             "shape_solver": self.shape_solver,
             "refine_solves": self.refine_solves,
             "refine_quality": self.refine_quality,
+            "measure_shell": self.measure_shell,
         }
 
     @property
@@ -470,6 +478,7 @@ class PackagingSettings:
                 if str(data.get("refine_quality") or "") in QUALITY_PRESETS
                 else defaults.refine_quality
             ),
+            measure_shell=bool(data.get("measure_shell", defaults.measure_shell)),
         )
 
 

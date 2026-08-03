@@ -966,6 +966,63 @@ def compute_run(run_id: str, body: dict | None = None) -> dict:
 # --------------------------------------------------------------------------
 
 
+def _measure_shell(scene: Scene, mesh, backend: str, emit) -> dict | None:
+    """Solve a built shell once, at the run's own quality, and report it.
+
+    The shape run is about a shape, so this is deliberately a headline number
+    and not a study: one backend, one speed, no curve. The full picture --
+    both solvers cross-checked, the whole speed sweep -- is what "Compute drag
+    on the shell" forks a proper run for, and this does not replace it.
+    """
+    trial = scene.without_results()
+    trial.geometry = Geometry.from_bytes(
+        mesh.export(file_type="stl"), source_name="shell.stl"
+    )
+    trial.payload = None
+    trial.fairing = None
+    trial.solver.sweep_mode = "scale"
+    trial.solver.backends = [backend]
+
+    emit({
+        "phase": "measure",
+        "message": f"Measuring the shell's drag with {backend} at "
+                   f"{trial.solver.quality} quality",
+    })
+    try:
+        results = run_scene(trial, backends=[backend])
+    except Cancelled:
+        raise
+    except Exception as error:
+        emit({"phase": "measure", "message": f"The shell's drag solve failed: {error}"})
+        return None
+
+    for solver_run in results.runs:
+        point = solver_run.reference_point()
+        if solver_run.status != "ok" or point is None:
+            emit({
+                "phase": "measure",
+                "message": f"The shell's drag solve failed: "
+                           f"{solver_run.message or 'no reference point'}",
+            })
+            return None
+        emit({
+            "phase": "measure",
+            "message": f"Shell drag: Cd {point.drag_coefficient:.4f}, "
+                       f"A {point.frontal_area:.4f} m², "
+                       f"Cd·A {point.drag_coefficient * point.frontal_area:.4f} m²",
+        })
+        return {
+            "drag_area": point.drag_coefficient * point.frontal_area,
+            "drag_coefficient": point.drag_coefficient,
+            "frontal_area": point.frontal_area,
+            "converged": bool(getattr(solver_run, "converged", True)),
+            "quality": trial.solver.quality,
+            "backend": backend,
+            "speed": point.speed,
+        }
+    return None
+
+
 @app.post("/api/runs/{run_id}/derive")
 def derive_shape(run_id: str) -> dict:
     """Open a shape run that wraps this run's geometry in one closed shell.
@@ -992,6 +1049,16 @@ def derive_shape(run_id: str) -> dict:
     scene.payload = payload_geometry
     scene.fairing = None
 
+    # Which backend can actually run here. Resolved once and used for both the
+    # true loop and the shell measurement, so they never disagree about what
+    # solved what.
+    available = {
+        info["name"] for info in solver_infos(scene.solver.processes) if info["available"]
+    }
+    measure_backend = next(
+        (name for name in scene.solver.backends if name in available), None
+    )
+
     # The true loop flies real candidates, so it needs a live backend. Resolve
     # it now: a 409 at click time beats a failed job at the front of the queue.
     refine_backend: str | None = None
@@ -1002,12 +1069,7 @@ def derive_shape(run_id: str) -> dict:
                 detail="The true loop tunes the streamlined envelope's angles; "
                 "switch the streamlined envelope on first.",
             )
-        available = {
-            info["name"] for info in solver_infos(scene.solver.processes) if info["available"]
-        }
-        refine_backend = next(
-            (name for name in scene.solver.backends if name in available), None
-        )
+        refine_backend = measure_backend
         if refine_backend is None:
             raise HTTPException(
                 status_code=409,
@@ -1114,7 +1176,30 @@ def derive_shape(run_id: str) -> dict:
                 )
                 shell = refinement.shell
 
+            # Measure what was built. Deriving a shape and not knowing its drag
+            # is the gap this whole tool exists to close, and making the user
+            # press a second button for it means the shape panel shows geometry
+            # next to no number at all. One solve at the run's own quality, on
+            # one backend, at the reference speed.
+            #
+            # The true loop's confirmation already *is* that solve -- same
+            # shell, same quality, same backend -- so reuse it rather than ask
+            # the solver the same question twice.
+            measurement = None
+            if refinement is not None and refinement.delivered_point is not None:
+                measurement = dict(refinement.delivered_point)
+                measurement["reused"] = True
+            elif measure_backend is not None and packaging.measure_shell:
+                measurement = _measure_shell(
+                    scene, shell.mesh, measure_backend, job.add_event
+                )
+
             warnings = list(coarse.warnings) + list(fine.warnings)
+            if measurement is not None and not measurement.get("converged", True):
+                warnings.append(
+                    "The shell's drag solve was still oscillating at the last iteration, "
+                    "so treat that coefficient as approximate and raise the iteration count."
+                )
             if refinement is not None:
                 if refinement.reverted_to_baseline:
                     warnings.append(
@@ -1152,6 +1237,8 @@ def derive_shape(run_id: str) -> dict:
             shell_record = shell.to_dict()
             if refinement is not None:
                 shell_record["refinement"] = refinement.to_dict()
+            if measurement is not None:
+                shell_record["measured"] = measurement
             run.shell = shell_record
             run.sweep = sweep.to_dict()
             run.shell_warnings = warnings

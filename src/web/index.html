@@ -106,6 +106,21 @@
         solver to measure the tail and nose angles this payload actually wants.
       </p>
 
+      <!-- The same setting as Solve → Quality, mirrored here because the
+           derive now depends on it: the true loop confirms its winner at this
+           quality, and the finished shell is measured at it. A button whose
+           behaviour is governed by a control two sections further down is a
+           button you cannot read. Both selects write the same value. -->
+      <div class="control">
+        <label class="control-label" for="shape-quality-select">Measured at</label>
+        <select id="shape-quality-select" class="control-select">
+          <option value="screening">Screening &mdash; fast</option>
+          <option value="balanced">Balanced</option>
+          <option value="accurate">Accurate &mdash; slow</option>
+        </select>
+      </div>
+      <p class="hint" id="shape-quality-hint"></p>
+
       <div class="action">
         <button id="btn-derive" class="btn btn-shape btn-wide">Derive a lower-drag shape</button>
         <p class="btn-why" id="derive-why"></p>

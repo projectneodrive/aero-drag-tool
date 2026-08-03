@@ -759,6 +759,7 @@ function lockControls(locked) {
     for (const control of Object.values(controls)) control.disable(locked);
   }
   $('quality-select').disabled = locked;
+  $('shape-quality-select').disabled = locked;
   $('processes-input').disabled = locked;
   $('btn-reset-attitude').disabled = locked;
   for (const input of $('solver-list').querySelectorAll('input')) input.disabled = locked;
@@ -1128,6 +1129,24 @@ function renderRoadHint() {
     : `a ${Math.abs(relative).toFixed(2)} m/s ${relative > 0 ? 'headwind' : 'tailwind'}`;
   hint.textContent = `${road.speed.toFixed(2)} m/s over the ground into ${air.toFixed(2)} m/s of `
     + `air: ${wind}. Pinned, so it stays put as the speed curve moves.`;
+}
+
+function renderShapeQualityHint() {
+  const hint = $('shape-quality-hint');
+  const run = state.run;
+  if (!run) { hint.textContent = ''; return; }
+  const quality = run.scene.solver?.quality || 'balanced';
+  const searchQ = run.scene.packaging?.refine_quality || 'screening';
+  const loop = run.scene.packaging?.shape_solver === 'cfd';
+  // Say what this setting does *here*, not what quality means in general --
+  // the Solve panel already covers that, and the reason it is mirrored into
+  // this section is that it governs two things the derive does.
+  hint.textContent = loop
+    ? `The same setting as Solve → Quality. The loop searches at ${searchQ} `
+      + `and then confirms its winner against the heuristic shell at ${quality}, `
+      + 'which is also what the shell is reported at.'
+    : `The same setting as Solve → Quality. The finished shell is solved once `
+      + `at ${quality} so its drag is on screen without a second run.`;
 }
 
 function renderProcesses() {
@@ -1784,6 +1803,22 @@ function renderShell() {
 
   const host = $('shell-tiles');
   host.textContent = '';
+
+  // The achieved drag goes first: it is the answer the shape was derived to
+  // get, and a shape panel that shows geometry beside no number at all invites
+  // exactly the assumption this tool exists to replace.
+  if (shell.measured) {
+    const m = shell.measured;
+    const headline = tile('Drag area (Cd·A)', fmt(m.drag_area, 4), 'm²',
+      `Cd ${fmt(m.drag_coefficient, 4)} · A ${fmt(m.frontal_area, 4)} m² · `
+      + `${m.backend} at ${m.quality}`
+      + (m.converged === false ? ' · unconverged' : '')
+      + (m.reused ? ' · from the loop’s confirmation solve' : ''));
+    headline.classList.add('tile-span');
+    if (m.converged === false) headline.classList.add('tile-warn');
+    host.append(headline);
+  }
+
   host.append(tile('Frontal area', fmt(shell.frontal_area, 4), 'm²', 'the number that sets drag'));
   host.append(tile('Closing radius', (shell.radius * 1000).toFixed(0), 'mm',
     shell.merge_radius !== null
@@ -2073,7 +2108,10 @@ function renderActions() {
           ? `, then 2 more at ${runQ} to confirm the winner really beats the heuristic`
           : '')
         + ' — minutes to an hour, watchable in the log.'
-      : '';
+      : (run.scene.packaging?.measure_shell && !noBackends
+        ? ` Then solves the shell once at ${runQ} quality, so its drag is on screen`
+          + ' without a second run.'
+        : '');
     deriveWhy.textContent = (isShape
       ? 'Re-wraps the same payload with these settings, as a new run.'
       : 'Wraps this shape in one closed shell, as a new run. This one is kept.')
@@ -2202,6 +2240,7 @@ function render() {
   renderSolverList();
   renderRoadHint();
   renderProcesses();
+  renderShapeQualityHint();
   renderProgress();
   renderResults();
   renderShell();
@@ -2246,7 +2285,11 @@ function adoptRun(payload, options = {}) {
   state.activeId = payload.id;
   if (!options.skipControls) {
     applyControls(payload.scene);
-    $('quality-select').value = payload.scene.solver.quality || 'balanced';
+    const quality = payload.scene.solver.quality || 'balanced';
+    // Two controls, one value: whichever the user touched, the other has to
+    // follow or the panel would show the setting disagreeing with itself.
+    $('quality-select').value = quality;
+    $('shape-quality-select').value = quality;
   }
   markChangedControls(payload.changed);
   render();
@@ -2538,7 +2581,7 @@ function wire() {
   onClick($('btn-compute'), 'compute', startCompute);
   onClick($('btn-derive'), 'derive', startDerive);
 
-  $('quality-select').addEventListener('change', async (event) => {
+  const onQualityChange = async (event) => {
     if (!state.run) return;
     try {
       adoptRun(await api(`/api/runs/${state.run.id}/quality`, {
@@ -2547,7 +2590,9 @@ function wire() {
         body: JSON.stringify({ quality: event.target.value }),
       }));
     } catch (error) { toast(error.message, true); }
-  });
+  };
+  $('quality-select').addEventListener('change', onQualityChange);
+  $('shape-quality-select').addEventListener('change', onQualityChange);
 
   $('processes-input').addEventListener('change', async (event) => {
     if (!state.run) return;

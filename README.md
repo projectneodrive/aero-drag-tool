@@ -184,6 +184,15 @@ it by taper rules in seconds; **True loop** puts the CFD solver inside the
 derivation and measures the nose and tail angles this payload actually wants
 (see [The true loop](#the-true-loop-measuring-the-angles-instead-of-assuming-them)).
 
+The derive ends by **solving the shell once** at the run's quality, so the
+shape panel shows the drag it achieved without you running anything else —
+one backend, one speed, a headline number. The true loop's confirmation is
+already that solve, so the loop path reuses it rather than paying twice.
+Because the derive now depends on the quality preset, that selector is
+mirrored into the Shape search panel next to the button (it is the same
+setting as Solve → Quality, not a second one). Turn the measurement off with
+`measure_shell` if you only want geometry.
+
 ### 4. Compute the shell's drag, and compare
 
 Press **Compute drag on the shell**. That opens the shell as its own run and
