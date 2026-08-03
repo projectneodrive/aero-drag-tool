@@ -382,8 +382,21 @@ is a choice rather than a property:
 
 Blended costs wetted area and length. It does **not** cost frontal area — the
 construction is bounded by the payload's own widest section, so the silhouette
-is identical and only the wetted area moves. On the sample cube a 0.6 blend
-holds the frontal area to within 0.02% while adding 23% volume.
+is identical and only the wetted area moves. On the sample trike, frontal area
+holds to within 0.1% across the whole range while volume climbs smoothly:
+
+| Shoulder fill | Frontal area | Wetted | Volume |
+|---|---|---|---|
+| 0.00 (faceted) | 0.4810 m² | 6.26 m² | 0.648 m³ |
+| 0.05 | 0.4812 m² | 6.71 m² | 0.692 m³ |
+| 0.10 | 0.4814 m² | 7.07 m² | 0.730 m³ |
+| 0.20 | 0.4814 m² | 7.70 m² | 0.792 m³ |
+
+The setting is the **radial fill** — how much extra section the shoulder
+carries, as a fraction of the body's cross-flow half-width. Not a streamwise
+length: turning 45° over a short distance needs a large fillet radius, so a
+length-based setting swelled the nose 6.5× harder than the tail and behaved as
+a two-position switch rather than a control.
 
 Which one is faster is a genuine question, so it is put to the solver rather
 than assumed: the true loop searches the blend as a third parameter, and its
@@ -391,16 +404,13 @@ range reaches down to zero, so a blended search contains the faceted shape and
 returns it if the fillet does not pay.
 
 ```bash
-python src/runner.py fair --payload sample2.stl --profile blended --shoulder-blend 0.5
+python src/runner.py fair --payload sample2.stl --profile blended --shoulder-fill 0.10
 ```
 
-In the GUI it is the **Shoulders** dropdown and the **Shoulder blend** slider
-under Shape search. The blend is quoted as a fraction of the payload's
-cross-flow half-width, so the same number means the same shape at any scale.
-It is a *length*, not a fillet radius, deliberately: an arc of radius r turning
-through the taper angle spans only `r·sin(angle)` along the flow, so a radius
-that visibly softens a 45° nose is invisible on a 12° tail, while a length
-blends both over comparable distances.
+In the GUI it is the **Shoulders** dropdown and the **Shoulder fill** slider
+under Shape search. It is quoted as a fraction of the payload's cross-flow
+half-width, so the same number means the same proportions at any scale, and
+useful values are small — 0.05 to 0.20.
 
 ### The true loop: measuring the angles instead of assuming them
 

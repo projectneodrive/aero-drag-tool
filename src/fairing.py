@@ -83,20 +83,28 @@ DEFAULT_TAIL_ANGLE_DEG = 12.0
 # 90 deg divide by ~zero in the padding maths.
 _ANGLE_BOUNDS = {"nose": (10.0, 80.0), "tail": (5.0, 45.0)}
 
-# How far a blended shoulder spreads along the flow, as a fraction of the
+# How much extra section a rounded shoulder carries, as a fraction of the
 # payload's cross-flow half-width. Zero reproduces the faceted envelope
 # exactly -- the minimal one, whose shoulders are creases -- so the two
 # profiles are one family, not two code paths, and the search can walk
 # continuously from one to the other.
 #
-# Quoted as a *length* rather than as the fillet radius, because a radius does
-# not mean the same thing at both ends: an arc of radius r turning through the
-# taper angle only spans r*sin(angle) streamwise, so a radius that visibly
-# softens a 45 deg nose is invisible on a 12 deg tail. A length blends both
-# shoulders over comparable distances, which is what "smooth transition"
-# actually asks for. The radius each shoulder needs follows from it.
-DEFAULT_SHOULDER_BLEND = 0.0
-_BLEND_BOUNDS = (0.0, 1.5)
+# This is the *radial* fill, deliberately, and it is the second thing tried.
+# The first parameterisation was the streamwise length the shoulder spreads
+# over, which reads more naturally but behaves terribly: turning 45 degrees
+# across a short distance demands a large fillet radius, so the offset came
+# out as 1.41x the length on the nose against 0.22x on the tail -- a 6.5x
+# asymmetry. On the sample trike a nominally gentle setting inflated the body
+# by 94 mm of radius everywhere, wetted area jumped 79% the instant the
+# setting left zero, and every larger value then saturated against the
+# frontal-area cap. A step function with two positions, not a blend.
+#
+# Filling by radius fixes that: the same fraction means the same fill-out at
+# both ends, small values stay small, and the parameter is the quantity that
+# actually costs drag rather than one that merely correlates with it. The
+# fillet radius each shoulder needs follows from it (see shoulder_radius).
+DEFAULT_SHOULDER_FILL = 0.0
+_FILL_BOUNDS = (0.0, 0.6)
 
 # How many tangent panels approximate each blended shoulder. The fillet is the
 # lower envelope of these, so more panels is a closer arc at one running-max
@@ -106,14 +114,14 @@ _BLEND_BOUNDS = (0.0, 1.5)
 SHOULDER_TANGENTS = 8
 
 
-def blend_bounds() -> tuple[float, float]:
-    """Validity bounds for the shoulder blend length, as a half-width fraction.
+def fill_bounds() -> tuple[float, float]:
+    """Validity bounds for the shoulder fill, as a half-width fraction.
 
-    Zero is the faceted envelope. Past the upper bound the fillet is longer
-    than the body is wide and the two shoulders start to run into each other,
-    where the construction stops meaning much.
+    Zero is the faceted envelope. Past the upper bound the fill approaches the
+    body's own half-width, where the envelope stops tapering at all and
+    saturates against the frontal-area cap -- more setting, same shape.
     """
-    return _BLEND_BOUNDS
+    return _FILL_BOUNDS
 
 
 def angle_bounds(kind: str) -> tuple[float, float]:
@@ -207,7 +215,7 @@ def build_grid(
     anisotropy: float = DEFAULT_ANISOTROPY,
     streamline: tuple[float, float] | None = None,
     clearance: float = 0.0,
-    shoulder_blend: float = DEFAULT_SHOULDER_BLEND,
+    shoulder_fill: float = DEFAULT_SHOULDER_FILL,
 ) -> PayloadGrid:
     """Voxelise ``mesh`` in the flow-aligned frame, with room to dilate into.
 
@@ -253,7 +261,7 @@ def build_grid(
     pad_upper = pad.copy()
     if streamline is not None:
         nose_room, tail_room = streamline_rooms(
-            extents, streamline, clearance, pitch, shoulder_blend
+            extents, streamline, clearance, pitch, shoulder_fill
         )
         pad_lower[0] += nose_room
         pad_upper[0] += tail_room
@@ -395,8 +403,8 @@ def _clamped_angles(nose_angle_deg: float, tail_angle_deg: float) -> tuple[float
     )
 
 
-def _clamped_blend(blend: float) -> float:
-    return float(np.clip(blend, *_BLEND_BOUNDS))
+def _clamped_fill(fill: float) -> float:
+    return float(np.clip(fill, *_FILL_BOUNDS))
 
 
 def streamline_rooms(
@@ -404,7 +412,7 @@ def streamline_rooms(
     angles: tuple[float, float],
     clearance: float,
     pitch: float,
-    blend: float = DEFAULT_SHOULDER_BLEND,
+    fill: float = DEFAULT_SHOULDER_FILL,
 ) -> tuple[float, float]:
     """Streamwise padding the nose and tail cones need, in metres.
 
@@ -414,54 +422,56 @@ def streamline_rooms(
     would clip the tail tip -- silently, which is the one failure mode this
     module keeps having to design out.
 
-    A blended shoulder pushes the taper downstream before it reaches full
-    rate, so the cone dies ``blend_radius * tan(angle)`` further out. That
-    term is small on a shallow tail and the whole fillet radius on a 45 degree
-    nose, which is exactly the asymmetry the fillet has: rounding a sharper
-    corner moves more.
+    A filled shoulder carries ``gap`` of extra section, so the profile
+    asymptotes to the bare taper offset outward by that much and the cone dies
+    ``gap / taper`` further along. The same fill therefore lengthens a shallow
+    tail more than a steep nose, which is the correct asymmetry: a shallower
+    taper takes longer to shed the same amount of section.
     """
     nose_deg, tail_deg = _clamped_angles(*angles)
     half_cross = 0.5 * float(min(extents[1], extents[2])) + clearance
-    blend_length = _clamped_blend(blend) * half_cross
+    gap = _clamped_fill(fill) * half_cross
 
     def room(degrees: float) -> float:
         taper = float(np.tan(np.radians(degrees)))
-        # The blended profile asymptotes to the bare taper offset outward by
-        # `gap`, so it dies `gap / taper` further along -- which works out to
-        # the blend length times hypot(1, taper), a touch over the blend
-        # length on a shallow tail and 1.41x it on a 45 degree nose.
-        reach = fillet_radius(taper, blend_length) * taper
-        return half_cross / taper + reach + clearance + 6 * pitch
+        return (half_cross + gap) / taper + clearance + 6 * pitch
 
     return float(room(nose_deg)), float(room(tail_deg))
 
 
-def fillet_radius(taper: float, blend_length: float) -> float:
-    """Fillet radius that spreads a shoulder over ``blend_length`` streamwise.
+def shoulder_radius(taper: float, gap: float) -> float:
+    """Fillet radius implied by filling a shoulder out by ``gap`` radially.
 
-    The shoulder turns through atan(taper), and an arc of radius r turning
-    through that angle covers r*sin(atan(taper)) along the flow. Inverting
-    that is the whole conversion.
+    The blend curve is the hyperbola asymptotic to the taper offset outward
+    by ``gap``, and its radius of curvature at the shoulder is gap / taper^2.
+    Reported rather than used: the construction below needs only the gap, and
+    a shallow tail's radius runs to metres for a fill of millimetres, which is
+    exactly why the radius is a poor thing to ask a user for.
     """
-    if blend_length <= 0.0 or taper <= 0.0:
+    if gap <= 0.0 or taper <= 0.0:
         return 0.0
-    return float(blend_length * np.hypot(1.0, taper) / taper)
+    return float(gap / (taper * taper))
 
 
 def shoulder_tangents(
-    taper: float, radius: float, pitch: float, count: int = SHOULDER_TANGENTS
+    taper: float, gap: float, pitch: float, count: int = SHOULDER_TANGENTS
 ) -> list[tuple[float, float]]:
     """Tangent lines whose lower envelope is the filleted taper profile.
 
     In the (streamwise, radius) plane the taper limit is a straight line, and
     the minimal envelope's shoulder is the corner where that line meets the
     payload's own section: the profile's slope jumps from zero to the full
-    taper across a single slice. Rounding that corner at ``radius`` replaces
+    taper across a single slice. Filling that corner out by ``gap`` replaces
     the line with the hyperbola tangent to the flat at the shoulder and
-    asymptotic to the same taper downstream, so the section still never
-    shrinks faster than the limit -- it just stops starting to discontinuously.
+    asymptotic to the same taper offset outward by ``gap``, so the section
+    still never shrinks faster than the limit -- it just stops starting to
+    discontinuously, and carries ``gap`` of extra section for the privilege.
 
-        r(d) = gap - sqrt((taper * d)^2 + gap^2),   gap = radius * taper^2
+        r(d) = gap - sqrt((taper * d)^2 + gap^2)
+
+    ``gap`` is the whole parameter: it is the extra section carried, which is
+    what costs wetted area and hence drag. The implied fillet radius is
+    gap / taper^2 (see shoulder_radius) and is merely a consequence.
 
     The trick that makes this nearly free: a concave curve is the infimum of
     its own tangents, and each tangent is a *straight taper with an outward
@@ -474,9 +484,8 @@ def shoulder_tangents(
     quarter turn from flat to full rate. Returns (per-slice step, offset) in
     metres, ready to subtract from and add to a carry.
     """
-    if radius <= 0.0 or count < 2:
+    if gap <= 0.0 or count < 2:
         return [(taper * pitch, 0.0)]
-    gap = radius * taper * taper
     turn = 0.5 * np.pi * np.arange(count) / (count - 1)
     return [
         (float(taper * np.sin(angle) * pitch), float(gap * (1.0 - np.cos(angle))))
@@ -487,8 +496,8 @@ def shoulder_tangents(
 def _cross_half_width(mask: np.ndarray, pitch: float) -> float:
     """Half the smaller cross-flow extent of ``mask``, in metres.
 
-    The fillet radius is quoted as a fraction of this, so a blend setting
-    means the same shape on any payload at any scale.
+    The shoulder fill is quoted as a fraction of this, so one setting means
+    the same proportions on any payload at any scale.
     """
     shadow = mask.any(axis=0)
     occupied = np.argwhere(shadow)
@@ -503,7 +512,7 @@ def streamline_mask(
     pitch: float,
     nose_angle_deg: float = DEFAULT_NOSE_ANGLE_DEG,
     tail_angle_deg: float = DEFAULT_TAIL_ANGLE_DEG,
-    blend: float = DEFAULT_SHOULDER_BLEND,
+    fill: float = DEFAULT_SHOULDER_FILL,
 ) -> np.ndarray:
     """The taper-bounded envelope of ``mask``, axis 0 along the flow.
 
@@ -511,7 +520,7 @@ def streamline_mask(
     that section swept downstream while eroding at tan(tail) per metre and
     upstream while eroding at tan(nose): each section casts a shallow cone
     aft and a steep one forward, and the body is the upper envelope of all of
-    them. At ``blend`` zero it is the smallest set that contains the payload,
+    them. At ``fill`` zero it is the smallest set that contains the payload,
     never grows steeper than the nose angle, and never shrinks steeper than
     the tail angle -- the "minimum drag body that still fits" under the
     attached-flow heuristic, before the solvers get their say.
@@ -524,9 +533,9 @@ def streamline_mask(
     erosions, so the positive set of the carry *is* the union of cones with
     no accumulated discretisation error.
 
-    ``blend`` rounds the shoulders where the cones meet the payload's own
+    ``fill`` rounds the shoulders where the cones meet the payload's own
     section, as a fraction of the cross-flow half-width. That corner is a
-    crease at blend zero, and unavoidably so: minimality forces the envelope
+    crease at fill zero, and unavoidably so: minimality forces the envelope
     to hold full section right up to the payload's last slice and to be
     shrinking at the full taper one slice later. **Minimality and tangent
     continuity are in direct conflict**, and minimum volume is not what this
@@ -542,7 +551,7 @@ def streamline_mask(
       the bare-taper envelope, so their minimum is too: a blended shell holds
       whatever the faceted one held, and the check downstream still verifies.
     * **Frontal area is unchanged.** The flat tangent (zero taper, zero
-      offset) is in the family, so the blend can never exceed the running
+      offset) is in the family, so the fill can never exceed the running
       maximum of the payload's own sections. The fillet is bought in wetted
       area and length, never in silhouette -- which is what makes it a fair
       question to put to a solver that ranks on Cd.A.
@@ -554,7 +563,7 @@ def streamline_mask(
     plateau's number.
     """
     nose_deg, tail_deg = _clamped_angles(nose_angle_deg, tail_angle_deg)
-    blend_length = _clamped_blend(blend) * _cross_half_width(mask, pitch)
+    gap = _clamped_fill(fill) * _cross_half_width(mask, pitch)
 
     envelope = np.zeros_like(mask)
     passes = (
@@ -564,7 +573,7 @@ def streamline_mask(
         (float(np.tan(np.radians(nose_deg))), range(mask.shape[0] - 1, -1, -1)),
     )
     for taper, order in passes:
-        tangents = shoulder_tangents(taper, fillet_radius(taper, blend_length), pitch)
+        tangents = shoulder_tangents(taper, gap, pitch)
         carries = [np.full(mask.shape[1:], -np.inf) for _ in tangents]
         blended = np.empty(mask.shape[1:], dtype=float)
         for index in order:
@@ -572,6 +581,16 @@ def streamline_mask(
                 carry -= step
             if mask[index].any():
                 section = ndimage.distance_transform_edt(mask[index], sampling=pitch)
+                # The transform returns 0 *outside* the section, and that zero
+                # is an absence, not a value. Maxing it in pins the carry to
+                # exactly zero across the whole background of every slice the
+                # payload appears in. The faceted threshold `> 0` hid that by
+                # excluding zero by a hair -- but it means the field sits flush
+                # against the line over a huge volume, so any outward offset
+                # lifts all of it across at once. That is what made the
+                # shoulder fill a step function: 2 mm of fill swallowed 40% of
+                # the grid. Only cells inside the section may contribute.
+                section[~mask[index]] = -np.inf
                 for carry in carries:
                     np.maximum(carry, section, out=carry)
             # The fillet is the *lower* envelope of the tangents: each is a
@@ -729,7 +748,7 @@ def build_fairing(
     smoothing_iterations: int = 12,
     streamline: tuple[float, float] | None = None,
     field_sigma_voxels: float = 1.2,
-    shoulder_blend: float = DEFAULT_SHOULDER_BLEND,
+    shoulder_fill: float = DEFAULT_SHOULDER_FILL,
 ) -> trimesh.Trimesh:
     """Build the fairing skin for one closing radius.
 
@@ -753,7 +772,7 @@ def build_fairing(
     """
     mask = closed_mask(grid, radius, anisotropy, distance_outside=_ensure_distance(grid, anisotropy))
     if streamline is not None:
-        mask = streamline_mask(mask, grid.pitch, *streamline, blend=shoulder_blend)
+        mask = streamline_mask(mask, grid.pitch, *streamline, fill=shoulder_fill)
         # The rooms added in build_grid keep the cones clear of the border;
         # clearing it anyway means a mis-sized grid yields a closed (if
         # clipped) surface instead of an open mesh that fails everywhere
@@ -826,7 +845,7 @@ class Shell:
     tail_angle_deg: float | None = None
     # Shoulder fillet as a fraction of the cross-flow half-width. Zero is the
     # faceted envelope, whose shoulders are creases.
-    shoulder_blend: float = DEFAULT_SHOULDER_BLEND
+    shoulder_fill: float = DEFAULT_SHOULDER_FILL
     mesh: trimesh.Trimesh = field(repr=False, default=None)
 
     def to_dict(self) -> dict:
@@ -846,7 +865,7 @@ class Shell:
             "streamlined": self.streamlined,
             "nose_angle_deg": self.nose_angle_deg,
             "tail_angle_deg": self.tail_angle_deg,
-            "shoulder_blend": self.shoulder_blend,
+            "shoulder_fill": self.shoulder_fill,
         }
 
 
@@ -906,7 +925,7 @@ def build_single_shell(
     progress=None,
     build_grid_override: PayloadGrid | None = None,
     streamline: tuple[float, float] | None = None,
-    shoulder_blend: float = DEFAULT_SHOULDER_BLEND,
+    shoulder_fill: float = DEFAULT_SHOULDER_FILL,
 ) -> Shell:
     """Build the one-body shell at the smallest radius that merges the payload.
 
@@ -924,7 +943,7 @@ def build_single_shell(
     """
     grid = build_grid_override or grid
     angles = _clamped_angles(*streamline) if streamline is not None else None
-    blend = _clamped_blend(shoulder_blend) if angles is not None else DEFAULT_SHOULDER_BLEND
+    fill = _clamped_fill(shoulder_fill) if angles is not None else DEFAULT_SHOULDER_FILL
     limit = grid.max_safe_radius(result.anisotropy, clearance)
 
     if result.merge_radius is None:
@@ -956,7 +975,7 @@ def build_single_shell(
             anisotropy=result.anisotropy,
             smoothing_iterations=smoothing_iterations,
             streamline=angles,
-            shoulder_blend=blend,
+            shoulder_fill=fill,
         )
         bodies = max(len(mesh.split(only_watertight=False)), 1)
         if bodies == 1:
@@ -989,6 +1008,6 @@ def build_single_shell(
         streamlined=angles is not None,
         nose_angle_deg=None if angles is None else angles[0],
         tail_angle_deg=None if angles is None else angles[1],
-        shoulder_blend=blend,
+        shoulder_fill=fill,
         mesh=mesh,
     )

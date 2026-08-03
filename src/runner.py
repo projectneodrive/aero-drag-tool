@@ -348,9 +348,9 @@ def command_fair(args: argparse.Namespace) -> int:
     payload_mesh = scene.payload.raw_mesh()
     direction = scene.wind.direction()
     streamline = None if args.no_streamline else (args.nose_angle, args.tail_angle)
-    blend = args.shoulder_blend if args.profile == "blended" else 0.0
+    blend = args.shoulder_fill if args.profile == "blended" else 0.0
     scene.packaging.envelope_profile = args.profile
-    scene.packaging.shoulder_blend = args.shoulder_blend
+    scene.packaging.shoulder_fill = args.shoulder_fill
 
     print(f"Voxelising {payload_path.name}")
     grid = fairing_module.build_grid(
@@ -382,13 +382,13 @@ def command_fair(args: argparse.Namespace) -> int:
     fine = fairing_module.build_grid(
         payload_mesh, direction=direction, resolution=args.resolution,
         anisotropy=args.anisotropy, streamline=streamline, clearance=args.clearance,
-        shoulder_blend=blend,
+        shoulder_fill=blend,
     )
     shell = fairing_module.build_single_shell(
         grid, payload_mesh, result, direction=direction,
         clearance=args.clearance,
         progress=lambda event: print(f"  {event['message']}"),
-        build_grid_override=fine, streamline=streamline, shoulder_blend=blend,
+        build_grid_override=fine, streamline=streamline, shoulder_fill=blend,
     )
 
     scene.geometry = Geometry.from_bytes(
@@ -404,7 +404,7 @@ def command_fair(args: argparse.Namespace) -> int:
         nose_angle_deg=shell.nose_angle_deg,
         tail_angle_deg=shell.tail_angle_deg,
         envelope_profile=args.profile,
-        shoulder_blend=shell.shoulder_blend,
+        shoulder_fill=shell.shoulder_fill,
     )
     scene.name = f"{payload_path.stem}_shell"
 
@@ -414,8 +414,8 @@ def command_fair(args: argparse.Namespace) -> int:
     shape = (
         f"streamlined, tail {shell.tail_angle_deg:.0f} deg, "
         + (
-            f"shoulders blended over {shell.shoulder_blend:.2f} half-widths"
-            if shell.shoulder_blend > 0
+            f"shoulders filled by {shell.shoulder_fill:.2f} of a half-width"
+            if shell.shoulder_fill > 0
             else "faceted shoulders"
         )
         if shell.streamlined
@@ -547,9 +547,9 @@ def build_parser() -> argparse.ArgumentParser:
         "(frontal area is identical either way)",
     )
     fair.add_argument(
-        "--shoulder-blend", type=float, default=0.5,
-        help="How far a blended shoulder spreads along the flow, as a fraction of "
-        "the payload's cross-flow half-width (default 0.5, ignored when faceted)",
+        "--shoulder-fill", type=float, default=0.10,
+        help="How much extra section a rounded shoulder carries, as a fraction of the "
+        "payload's cross-flow half-width (default 0.10, ignored when faceted)",
     )
     _add_scene_options(fair)
     fair.set_defaults(handler=command_fair)

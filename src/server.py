@@ -1145,7 +1145,7 @@ def derive_shape(run_id: str) -> dict:
                 anisotropy=packaging.anisotropy,
                 streamline=streamline,
                 clearance=packaging.clearance,
-                shoulder_blend=packaging.blend,
+                shoulder_fill=packaging.fill,
             )
             shell = fairing_module.build_single_shell(
                 coarse,
@@ -1156,7 +1156,7 @@ def derive_shape(run_id: str) -> dict:
                 progress=job.add_event,
                 build_grid_override=fine,
                 streamline=streamline,
-                shoulder_blend=packaging.blend,
+                shoulder_fill=packaging.fill,
             )
 
             refinement = None
@@ -1252,7 +1252,7 @@ def derive_shape(run_id: str) -> dict:
                 nose_angle_deg=shell.nose_angle_deg,
                 tail_angle_deg=shell.tail_angle_deg,
                 envelope_profile=packaging.envelope_profile,
-                shoulder_blend=shell.shoulder_blend,
+                shoulder_fill=shell.shoulder_fill,
             )
             # The loop measured the angles rather than assuming them; write
             # what it found back into the run's own knobs, so deriving again
@@ -1267,9 +1267,9 @@ def derive_shape(run_id: str) -> dict:
                     run.solved_params["packaging.nose_angle_deg"] = refinement.best.nose_deg
                     run.solved_params["packaging.tail_angle_deg"] = refinement.best.tail_deg
                 if run.scene.packaging.envelope_profile == "blended":
-                    run.scene.packaging.shoulder_blend = refinement.best.blend
+                    run.scene.packaging.shoulder_fill = refinement.best.fill
                     if run.solved_params is not None:
-                        run.solved_params["packaging.shoulder_blend"] = refinement.best.blend
+                        run.solved_params["packaging.shoulder_fill"] = refinement.best.fill
             run.status = "done"
             run.solved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             run.duration_s = time.time() - started

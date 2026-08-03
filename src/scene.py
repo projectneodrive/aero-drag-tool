@@ -400,9 +400,11 @@ class PackagingSettings:
     # shoulders instead, buying tangent continuity with wetted area and
     # length. Both are worth flying; the loop can search between them.
     envelope_profile: str = "faceted"  # or "blended"
-    # Streamwise length of each blended shoulder, as a fraction of the
-    # payload's cross-flow half-width. Ignored when faceted.
-    shoulder_blend: float = 0.5
+    # How much extra section each rounded shoulder carries, as a fraction of
+    # the payload's cross-flow half-width. Ignored when faceted. This is the
+    # *radial* fill: parameterising by streamwise length instead made the nose
+    # swell 6.5x harder than the tail and left a control with two positions.
+    shoulder_fill: float = 0.10
     # "heuristic" builds the envelope at the angles above and stops. "cfd" then
     # puts the solver in the loop: a budget of screening solves walks the tail
     # and nose angles to whatever this payload at these conditions actually
@@ -436,7 +438,7 @@ class PackagingSettings:
             "nose_angle_deg": self.nose_angle_deg,
             "tail_angle_deg": self.tail_angle_deg,
             "envelope_profile": self.envelope_profile,
-            "shoulder_blend": self.shoulder_blend,
+            "shoulder_fill": self.shoulder_fill,
             "shape_solver": self.shape_solver,
             "refine_solves": self.refine_solves,
             "refine_quality": self.refine_quality,
@@ -444,13 +446,13 @@ class PackagingSettings:
         }
 
     @property
-    def blend(self) -> float:
+    def fill(self) -> float:
         """The blend length actually in force, zero when faceted.
 
         One accessor rather than a `profile == "blended"` test at every call
         site, so the two settings can never disagree about what was built.
         """
-        return self.shoulder_blend if self.envelope_profile == "blended" else 0.0
+        return self.shoulder_fill if self.envelope_profile == "blended" else 0.0
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "PackagingSettings":
@@ -470,7 +472,7 @@ class PackagingSettings:
             nose_angle_deg=_as_float(data.get("nose_angle_deg"), defaults.nose_angle_deg),
             tail_angle_deg=_as_float(data.get("tail_angle_deg"), defaults.tail_angle_deg),
             envelope_profile=profile,
-            shoulder_blend=_as_float(data.get("shoulder_blend"), defaults.shoulder_blend),
+            shoulder_fill=_as_float(data.get("shoulder_fill"), defaults.shoulder_fill),
             shape_solver=solver,
             refine_solves=max(int(data.get("refine_solves") or defaults.refine_solves), 3),
             refine_quality=(
@@ -497,7 +499,7 @@ class FairingSpec:
     nose_angle_deg: float | None = None
     tail_angle_deg: float | None = None
     envelope_profile: str = "faceted"
-    shoulder_blend: float = 0.0
+    shoulder_fill: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -512,7 +514,7 @@ class FairingSpec:
             "nose_angle_deg": self.nose_angle_deg,
             "tail_angle_deg": self.tail_angle_deg,
             "envelope_profile": self.envelope_profile,
-            "shoulder_blend": self.shoulder_blend,
+            "shoulder_fill": self.shoulder_fill,
         }
 
     @classmethod
@@ -533,7 +535,7 @@ class FairingSpec:
             tail_angle_deg=None if data.get("tail_angle_deg") is None
             else float(data["tail_angle_deg"]),
             envelope_profile=str(data.get("envelope_profile") or "faceted"),
-            shoulder_blend=_as_float(data.get("shoulder_blend"), 0.0),
+            shoulder_fill=_as_float(data.get("shoulder_fill"), 0.0),
         )
 
 

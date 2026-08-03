@@ -86,7 +86,11 @@ const CONTROL_SPECS = {
       ],
     },
     {
-      key: 'shoulder_blend', label: 'Shoulder blend', min: 0, max: 1.5, step: 0.05, decimals: 2,
+      // How much extra section a rounded shoulder carries, as a fraction of
+      // the body's half-width. The *radial* fill, not a streamwise length:
+      // filling by length made the nose swell 6.5x harder than the tail and
+      // turned the control into a two-position switch.
+      key: 'shoulder_fill', label: 'Shoulder fill', min: 0, max: 0.6, step: 0.01, decimals: 2,
     },
   ],
   solver: [
@@ -1839,12 +1843,12 @@ function renderShell() {
     // The wetted area is the price of a blended shoulder, and the frontal
     // area above is what it deliberately does not touch, so the two read
     // together as the whole of the trade.
-    const blended = shell.shoulder_blend > 0;
+    const blended = shell.shoulder_fill > 0;
     host.append(tile('Shoulders',
       blended ? 'blended' : 'faceted',
       null,
       blended
-        ? `rounded over ${fmt(shell.shoulder_blend, 2)} half-widths · `
+        ? `filled out by ${fmt(shell.shoulder_fill, 2)} of a half-width · `
           + `wetted ${fmt(shell.wetted_area, 2)} m²`
         : `flat panels, creased at the shoulder · wetted ${fmt(shell.wetted_area, 2)} m²`));
   }
@@ -1853,7 +1857,7 @@ function renderShell() {
     const ref = shell.refinement;
     const gain = (ref.improvement === null || ref.improvement === undefined)
       ? null : ref.improvement * 100;
-    const searchedBlend = ref.blend_bracket !== null && ref.blend_bracket !== undefined;
+    const searchedBlend = ref.fill_bracket !== null && ref.fill_bracket !== undefined;
     // A reverted loop is the guarantee working, not the loop failing: its
     // winner lost on the finer mesh and the heuristic shell was kept. Saying
     // "reverted" rather than showing a gain of zero is the honest version.
@@ -1861,7 +1865,7 @@ function renderShell() {
       ref.reverted_to_baseline
         ? 'the heuristic shell won'
         : `tail ${fmt(ref.best.tail_deg, 1)}° · nose ${fmt(ref.best.nose_deg, 1)}°`
-          + (searchedBlend ? ` · blend ${fmt(ref.best.blend, 2)}` : ''),
+          + (searchedBlend ? ` · fill ${fmt(ref.best.fill, 2)}` : ''),
       null,
       (ref.reverted_to_baseline
         ? `the ${ref.search_quality} search picked tail ${fmt(ref.history.at(-1)?.tail_deg ?? 0, 1)}°, `
@@ -1869,7 +1873,7 @@ function renderShell() {
         : `measured over ${ref.solves} ${ref.backend} solves`)
         + (gain === null ? '' : ` · Cd·A ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}%`
           + ` vs the heuristic${ref.confirm_quality ? ` at ${ref.confirm_quality}` : ''}`)
-        + (searchedBlend && !ref.reverted_to_baseline && ref.best.blend <= 0
+        + (searchedBlend && !ref.reverted_to_baseline && ref.best.fill <= 0
           ? ' · the crease measured no worse than any fillet' : ''));
     refined.classList.add('tile-span');
     if (ref.reverted_to_baseline) refined.classList.add('tile-warn');
@@ -2100,7 +2104,7 @@ function renderActions() {
     const loopNote = cfdLoop
       ? ` Then flies ~${run.scene.packaging?.refine_solves || 10} ${searchQ} solves to tune the`
         + ' tail and nose angles'
-        + (run.scene.packaging?.envelope_profile === 'blended' ? ' and the shoulder blend' : '')
+        + (run.scene.packaging?.envelope_profile === 'blended' ? ' and the shoulder fill' : '')
         // The confirmation is what stops a coarse-mesh ranking being handed
         // back as an answer, so it belongs in the time estimate, not as a
         // surprise at the end of the log.

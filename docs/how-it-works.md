@@ -731,13 +731,31 @@ So the shoulder treatment is a **profile setting**, not a fixed property:
 | | |
 |---|---|
 | **Faceted** | the minimal envelope — flat panels, creased shoulders. Shortest and smallest body that satisfies the taper limits. |
-| **Blended** | the shoulders rounded over a blend length, tangent-continuous into both the flat and the taper. |
+| **Blended** | the shoulders filled out, tangent-continuous into both the flat and the taper. |
 
 Blended costs wetted area and length and buys tangent continuity. Which wins
 is a real question with a real answer, so it is put to the solver: the true
-loop searches the blend length as a third parameter alongside the two angles,
-and its bracket reaches down to zero — so a blended search *contains* the
-faceted shape and can hand it back if the fillet does not pay.
+loop searches the **shoulder fill** as a third parameter alongside the two
+angles, and its bracket reaches down to zero — so a blended search *contains*
+the faceted shape and can hand it back if the fillet does not pay.
+
+> **The setting is a radial fill, and that took two goes.** The obvious knob is
+> the streamwise distance the shoulder spreads over — it reads naturally and it
+> is what "smooth transition" sounds like. It behaves terribly. Turning 45°
+> across a short distance demands a large fillet radius, so the same setting
+> swelled the nose 6.5× harder than the tail. Filling by *radius* instead makes
+> one number mean the same fill-out at both ends, and it is the quantity that
+> actually costs wetted area rather than one that merely correlates with it.
+>
+> That rewrite also exposed a latent bug worth knowing about. `distance_transform_edt`
+> returns **0 outside** the section, and that zero is an absence, not a value —
+> maxing it into the carry pinned the field to exactly zero across the whole
+> background of every slice the payload appears in. The faceted threshold `> 0`
+> hid it by excluding zero *by a hair*, so the field sat flush against the line
+> over a huge volume and any outward offset lifted all of it across at once:
+> 2 mm of fill swallowed 40% of the grid. The faceted envelope is bit-identical
+> before and after the fix, which is exactly why nobody noticed until the fill
+> arrived.
 
 > **How the fillet is computed.** A blended shoulder is an arc tangent to the
 > flat at one end and to the taper at the other. The trick that makes it
@@ -755,14 +773,16 @@ faceted shape and can hand it back if the fillet does not pay.
 
 Measured on the sample cube at 30 mm clearance, tail 12°, nose 45°:
 
-| Blend | Frontal area | Volume | Length |
-|---|---|---|---|
-| 0.00 (faceted) | 1.1312 m² | 2.358 m³ | 3.95 m |
-| 0.60 (blended) | 1.1310 m² | 2.906 m³ | 4.35 m |
+| Shoulder fill | Frontal area | Wetted | Volume | Length |
+|---|---|---|---|---|
+| 0.00 (faceted) | 1.1268 m² | 11.22 m² | 2.330 m³ | 3.95 m |
+| 0.05 | 1.1268 m² | 11.78 m² | 2.476 m³ | 4.09 m |
+| 0.10 | 1.1268 m² | 12.28 m² | 2.607 m³ | 4.24 m |
+| 0.20 | 1.1268 m² | 13.14 m² | 2.826 m³ | 4.48 m |
 
-Frontal area holds to 0.02% — voxelisation noise, not a real change — while
-the volume the fillet costs is plainly visible. That is the trade in one
-table, and the reason the loop is the thing that should settle it.
+Frontal area does not move at all, while the wetted area and volume the fillet
+costs climb smoothly. That is the trade in one table, and the reason the loop
+is the thing that should settle it.
 
 > **How it's computed exactly.** The obvious way — erode the shape by a
 > sliver, slice by slice — fails, because tan(12°) × 16 mm is 3.4 mm, a fifth

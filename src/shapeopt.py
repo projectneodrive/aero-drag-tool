@@ -119,7 +119,7 @@ MIN_SPAN_DEG = {"tail": 6.0, "nose": 14.0}
 TAIL_SHARE = 0.6
 # With a blend to search as well, the tail yields some of its share rather
 # than the other two splitting what is left of a budget it already took.
-TAIL_SHARE_BLENDED = 0.45
+TAIL_SHARE_FILLED = 0.45
 
 # Fewest new solves a pass needs before it is descending rather than merely
 # bracketing: golden section spends its first two probes on the bracket.
@@ -130,12 +130,12 @@ MIN_USEFUL_PASS = 3
 ANGLE_RESOLUTION_DEG = 0.5
 # The blend is a fraction of the half-width, so its resolution is relative
 # too: 0.05 of a half-width is millimetres of shoulder on any real payload.
-BLEND_RESOLUTION = 0.05
+FILL_RESOLUTION = 0.05
 
 # Bracket widths each pass shrinks to before it calls the parameter settled.
 TAIL_TOLERANCE_DEG = 1.5
 NOSE_TOLERANCE_DEG = 4.0
-BLEND_TOLERANCE = 0.12
+FILL_TOLERANCE = 0.12
 
 GOLDEN = 0.6180339887498949
 
@@ -151,10 +151,10 @@ class Evaluation:
     frontal_area: float | None
     solve_seconds: float
     message: str = ""
-    # Shoulder blend length as a fraction of the cross-flow half-width. Zero
-    # is the faceted envelope, so a blended search that finds nothing better
-    # than a crease can say so in the same units.
-    blend: float = 0.0
+    # Shoulder fill as a fraction of the cross-flow half-width. Zero is the
+    # faceted envelope, so a filled search that finds nothing better than a
+    # crease can say so in the same units.
+    fill: float = 0.0
     # Did this solve settle? An unconverged candidate still carries a number,
     # but the ranking it takes part in is worth less than it looks.
     converged: bool = True
@@ -163,7 +163,7 @@ class Evaluation:
         return {
             "nose_deg": self.nose_deg,
             "tail_deg": self.tail_deg,
-            "blend": self.blend,
+            "fill": self.fill,
             "converged": self.converged,
             "drag_area": self.drag_area,
             "drag_coefficient": self.drag_coefficient,
@@ -187,7 +187,7 @@ class RefineResult:
     # its own bounds rather than as if the whole angle range had been flown.
     tail_bracket: tuple[float, float] | None = None
     nose_bracket: tuple[float, float] | None = None
-    blend_bracket: tuple[float, float] | None = None
+    fill_bracket: tuple[float, float] | None = None
     at_bracket_edge: list[str] = field(default_factory=list)
     # What the search ranked on, and what the winner was then checked at.
     search_quality: str = "screening"
@@ -250,7 +250,7 @@ class RefineResult:
             "improvement": self.improvement,
             "tail_bracket": list(self.tail_bracket) if self.tail_bracket else None,
             "nose_bracket": list(self.nose_bracket) if self.nose_bracket else None,
-            "blend_bracket": list(self.blend_bracket) if self.blend_bracket else None,
+            "fill_bracket": list(self.fill_bracket) if self.fill_bracket else None,
             "at_bracket_edge": list(self.at_bracket_edge),
             "search_quality": self.search_quality,
             "confirm_quality": self.confirm_quality,
@@ -266,8 +266,8 @@ def _quantise(value: float) -> float:
     return round(value / ANGLE_RESOLUTION_DEG) * ANGLE_RESOLUTION_DEG
 
 
-def _quantise_blend(value: float) -> float:
-    return round(value / BLEND_RESOLUTION) * BLEND_RESOLUTION
+def _quantise_fill(value: float) -> float:
+    return round(value / FILL_RESOLUTION) * FILL_RESOLUTION
 
 
 def bracket_around(start: float, reach: tuple[float, float], kind: str) -> tuple[float, float]:
@@ -395,7 +395,7 @@ def refine_envelope(
     history: list[Evaluation] = []
     best_shell: dict = {"key": None, "shell": None}
     budget = {"left": int(max_solves)}
-    blended = packaging.envelope_profile == "blended"
+    filled = packaging.envelope_profile == "blended"
     # What the search ranks on, and what the answer will be read at. When they
     # differ the ranking is a proxy, and the confirmation stage checks it.
     search_quality = packaging.refine_quality
@@ -407,9 +407,9 @@ def refine_envelope(
 
     def label(key: tuple[float, float, float]) -> str:
         text = f"tail {key[1]:.1f}°, nose {key[0]:.1f}°"
-        return f"{text}, blend {key[2]:.2f}" if blended else text
+        return f"{text}, fill {key[2]:.2f}" if filled else text
 
-    def build_shell(nose: float, tail: float, blend: float) -> fairing.Shell:
+    def build_shell(nose: float, tail: float, fill: float) -> fairing.Shell:
         fine = fairing.build_grid(
             payload_mesh,
             direction=direction,
@@ -417,7 +417,7 @@ def refine_envelope(
             anisotropy=packaging.anisotropy,
             streamline=(nose, tail),
             clearance=packaging.clearance,
-            shoulder_blend=blend,
+            shoulder_fill=fill,
         )
         return fairing.build_single_shell(
             coarse_grid,
@@ -427,13 +427,13 @@ def refine_envelope(
             clearance=packaging.clearance,
             build_grid_override=fine,
             streamline=(nose, tail),
-            shoulder_blend=blend,
+            shoulder_fill=fill,
         )
 
     def evaluate(
-        nose: float, tail: float, blend: float, shell: fairing.Shell | None = None
+        nose: float, tail: float, fill: float, shell: fairing.Shell | None = None
     ) -> Evaluation:
-        key = (_quantise(nose), _quantise(tail), _quantise_blend(blend if blended else 0.0))
+        key = (_quantise(nose), _quantise(tail), _quantise_fill(fill if filled else 0.0))
         if key in evaluations:
             return evaluations[key]
         if budget["left"] <= 0:
@@ -498,7 +498,7 @@ def refine_envelope(
             frontal_area=area,
             solve_seconds=time.time() - started,
             message=message,
-            blend=key[2],
+            fill=key[2],
             converged=converged,
         )
         evaluations[key] = evaluation
@@ -606,7 +606,7 @@ def refine_envelope(
     # ---------------------------------------------------------------- search
     nose0 = float(packaging.nose_angle_deg)
     tail0 = float(packaging.tail_angle_deg)
-    blend0 = float(packaging.blend)
+    fill0 = float(packaging.fill)
 
     # Both angle brackets straddle the heuristic values, so every pass can
     # lengthen the shell as readily as it shorten it.
@@ -616,22 +616,22 @@ def refine_envelope(
     # envelope. So a blended search contains the sharp-shouldered shape as a
     # candidate and can hand it back if the fillet does not pay -- the profile
     # choice is a starting point, not a verdict the loop is made to defend.
-    blend_bracket = fairing.blend_bounds() if blended else None
+    fill_bracket = fairing.fill_bounds() if filled else None
 
-    plan = "tail first, then nose" + (", then the shoulder blend" if blended else "")
+    plan = "tail first, then nose" + (", then the shoulder fill" if filled else "")
     ranges = (
         f"Searching tail {tail_bracket[0]:.0f}–{tail_bracket[1]:.0f}°, "
         f"nose {nose_bracket[0]:.0f}–{nose_bracket[1]:.0f}°"
     )
-    if blended:
-        ranges += f", blend {blend_bracket[0]:.2f}–{blend_bracket[1]:.2f}"
+    if filled:
+        ranges += f", fill {fill_bracket[0]:.2f}–{fill_bracket[1]:.2f}"
     emit(
         f"True loop: {max_solves} screening solves with {backend}, {plan}. "
         f"Heuristic start: tail {tail0:.0f}°, nose {nose0:.0f}°"
-        + (f", blend {blend0:.2f}" if blended else "")
+        + (f", fill {fill0:.2f}" if filled else "")
         + f". {ranges}."
     )
-    baseline = evaluate(nose0, tail0, blend0, shell=baseline_shell)
+    baseline = evaluate(nose0, tail0, fill0, shell=baseline_shell)
     if baseline.drag_area is None:
         raise RuntimeError(
             f"The baseline shell failed to solve ({baseline.message}); "
@@ -648,10 +648,10 @@ def refine_envelope(
     # descending, so halving a small budget buys two passes that bracket and
     # neither that descends. There the tail takes the lot, which is the same
     # order of preference, just with nothing left over.
-    passes = 3 if blended else 2
+    passes = 3 if filled else 2
     left = max(budget["left"], 0)
     if left >= passes * MIN_USEFUL_PASS:
-        share = TAIL_SHARE if passes == 2 else TAIL_SHARE_BLENDED
+        share = TAIL_SHARE if passes == 2 else TAIL_SHARE_FILLED
         tail_cap = min(
             max(MIN_USEFUL_PASS, int(round(share * left))),
             left - (passes - 1) * MIN_USEFUL_PASS,
@@ -660,7 +660,7 @@ def refine_envelope(
         tail_cap = left
     golden_section(
         *tail_bracket,
-        run_eval=lambda tail: evaluate(nose0, tail, blend0),
+        run_eval=lambda tail: evaluate(nose0, tail, fill0),
         min_width=TAIL_TOLERANCE_DEG,
         cap=tail_cap,
     )
@@ -674,11 +674,11 @@ def refine_envelope(
     # a bonus and only gets what is spare. Reserving for the refit as though
     # it were primary takes solves from the nose, which is a real design
     # variable, to re-check one that has already been searched.
-    reserve = (MIN_USEFUL_PASS if blended else 0) + min(2, budget["left"] // 4)
+    reserve = (MIN_USEFUL_PASS if filled else 0) + min(2, budget["left"] // 4)
     reserve = min(reserve, max(budget["left"] - MIN_USEFUL_PASS, 0))
     golden_section(
         *nose_bracket,
-        run_eval=lambda nose: evaluate(nose, tail_best, blend0),
+        run_eval=lambda nose: evaluate(nose, tail_best, fill0),
         min_width=NOSE_TOLERANCE_DEG,
         cap=budget["left"] - reserve,
     )
@@ -689,22 +689,22 @@ def refine_envelope(
     # fillet is bounded by the payload's own widest section by construction --
     # so it trades pure wetted area against pure separation, and reading that
     # trade is only meaningful once the body it sits on has stopped moving.
-    blend_best = blend0
-    if blended and budget["left"] > 1:
+    fill_best = fill0
+    if filled and budget["left"] > 1:
         reserve = min(MIN_USEFUL_PASS, budget["left"] // 3)
         golden_section(
-            *blend_bracket,
-            run_eval=lambda blend: evaluate(nose_best, tail_best, blend),
-            min_width=BLEND_TOLERANCE,
+            *fill_bracket,
+            run_eval=lambda fill: evaluate(nose_best, tail_best, fill),
+            min_width=FILL_TOLERANCE,
             cap=budget["left"] - reserve,
         )
-        blend_best = best_so_far().blend
+        fill_best = best_so_far().fill
 
     # The passes are sequential, so the tail was settled against the heuristic
     # nose and no blend at all. Spend anything left re-fitting it around the
     # winner: the passes are only separable to the extent the parameters do
     # not interact, and this is what tests that rather than assuming it.
-    if budget["left"] > 1 and (nose_best != nose0 or blend_best != blend0):
+    if budget["left"] > 1 and (nose_best != nose0 or fill_best != fill0):
         span = tail_bracket[1] - tail_bracket[0]
         refit = (
             max(tail_bracket[0], tail_best - 0.25 * span),
@@ -712,7 +712,7 @@ def refine_envelope(
         )
         golden_section(
             *refit,
-            run_eval=lambda tail: evaluate(nose_best, tail, blend_best),
+            run_eval=lambda tail: evaluate(nose_best, tail, fill_best),
             min_width=TAIL_TOLERANCE_DEG,
             cap=budget["left"],
         )
@@ -736,8 +736,8 @@ def refine_envelope(
     best_point = baseline_point = delivered = None
     confirmed_best = confirmed_baseline = None
     reverted = False
-    changed = (best.nose_deg, best.tail_deg, best.blend) != (
-        _quantise(nose0), _quantise(tail0), _quantise_blend(blend0),
+    changed = (best.nose_deg, best.tail_deg, best.fill) != (
+        _quantise(nose0), _quantise(tail0), _quantise_fill(fill0),
     )
     if changed and final_quality != search_quality:
         emit(
@@ -794,10 +794,10 @@ def refine_envelope(
     # Only the top of the blend range is worth flagging. Landing on zero is
     # not a wall -- it is the loop reporting that this payload wanted the
     # faceted shoulder after all, which is a result rather than a limit.
-    if blended and _at_edge(best.blend, blend_bracket, BLEND_TOLERANCE) == "high":
+    if filled and _at_edge(best.fill, fill_bracket, FILL_TOLERANCE) == "high":
         edges.append(
-            f"the shoulder blend is at the top of its range "
-            f"({blend_bracket[0]:.2f}–{blend_bracket[1]:.2f})"
+            f"the shoulder fill is at the top of its range "
+            f"({fill_bracket[0]:.2f}–{fill_bracket[1]:.2f})"
         )
 
     result = RefineResult(
@@ -809,7 +809,7 @@ def refine_envelope(
         shell=shell,
         tail_bracket=tail_bracket,
         nose_bracket=nose_bracket,
-        blend_bracket=blend_bracket,
+        fill_bracket=fill_bracket,
         at_bracket_edge=edges,
         search_quality=search_quality,
         confirm_quality=final_quality if confirmed_best is not None else None,
@@ -827,7 +827,7 @@ def refine_envelope(
         emit(
             f"Loop done after {result.solves} solves: keeping the heuristic shell "
             f"(tail {best.tail_deg:.1f}°, nose {best.nose_deg:.1f}°"
-            + (f", blend {best.blend:.2f}" if blended else "")
+            + (f", fill {best.fill:.2f}" if filled else "")
             + f"). Its Cd·A at {final_quality} is {confirmed_baseline:.4f} m²"
             + (
                 f", against {confirmed_best:.4f} m² for what the {search_quality} "
@@ -842,13 +842,13 @@ def refine_envelope(
         emit(
             f"Loop done after {result.solves} solves: tail {best.tail_deg:.1f}°, "
             f"nose {best.nose_deg:.1f}°"
-            + (f", blend {best.blend:.2f}" if blended else "")
+            + (f", fill {best.fill:.2f}" if filled else "")
             + f", Cd·A {value:.4f} m² at {quality}"
             + (f" ({gain * 100:+.1f}% vs the heuristic angles)" if gain is not None else "")
         )
-    if blended and best.blend <= BLEND_TOLERANCE and not reverted:
+    if filled and best.fill <= FILL_TOLERANCE and not reverted:
         emit(
-            "The blend came back at zero: on this payload the faceted shoulder "
+            "The fill came back at zero: on this payload the faceted shoulder "
             "measured no worse than any fillet the loop tried."
         )
     # A search made mostly of unconverged solves has ranked noise, and the
