@@ -846,7 +846,82 @@ Why golden section rather than something cleverer like gradient descent?
 
 The tool searches **tail first**, then nose with the tail held at its best —
 because the tail dominates the trade and deserves the bigger share of a small
-budget.
+budget — then the tail again around the measured nose if the budget allows,
+since the passes are only separable to the extent the knobs don't interact.
+
+### 4.2b The trap: the search mesh is not the judging mesh
+
+"A couple of percent of noise" is the optimistic reading, and on a real
+payload it is wrong. Here is the sample trike, four shells differing only in
+tail angle, each solved at **both** qualities. Frontal area is constant to
+four decimal places **by construction** — the envelope can't exceed the
+payload's widest section — so every difference below is pure Cd:
+
+| Tail | Cd screening | Cd balanced | error |
+|---|---|---|---|
+| 9° | 0.4850 | 0.4581 | +5.9% |
+| 12° | **0.6629** | 0.4606 | **+43.9%** |
+| 16° | **0.3860** | 0.4470 | **−13.6%** |
+| 20° | 0.4097 | 0.4199 | −2.4% |
+
+The balanced column spans 9.7% across the whole bracket and moves smoothly:
+that is the aerodynamics, and it is a **modest effect**. The screening column
+spans 72% and isn't even monotone — going 9° → 12° → 16° it reports drag
+going **up 37%, then down 42%** on a shape changing smoothly.
+
+Signal ~10%, measurement error up to 44%. **The search is fitting noise.** Its
+answer is close to random within the bracket, which is exactly why the loop
+sometimes returns something better than the heuristic and sometimes something
+worse. Screening picks 16° here; balanced says 20°.
+
+Now the part that makes this genuinely nasty: **that 0.6629 solve converged.**
+It wasn't oscillating, it raised no warning, it settled confidently on a
+number 44% wrong — because a 26-cell mesh cannot resolve a long shallow
+afterbody, and a converged solve on an inadequate mesh is just a stable wrong
+answer. No convergence check will ever catch it. Only a finer mesh will.
+
+Left alone, the loop would hand you 16° and you'd find out later.
+
+So the loop **confirms**. After the search it solves its own winner *and* the
+heuristic shell at the run's own quality, keeps whichever really wins, and
+reports a revert honestly:
+
+```
+   search (screening):  16° wins at Cd·A 0.1832
+   confirm (balanced):  16° → 0.xxxx   vs   12° → 0.xxxx
+                        └── if 12° wins, keep it and say so
+```
+
+Two extra solves, charged *outside* the search budget — the budget buys
+search, and a tight one must not silently drop the check. This is what makes
+"the loop can never hand back something worse than the heuristic" a statement
+about the mesh you read rather than the mesh it searched.
+
+But be clear about what the confirmation can and cannot do. It can **refuse a
+bad answer**. It cannot **manufacture a good one** — if the search ranked
+noise, the best it can do is hand back the heuristic shell. So on a payload
+like the trike, raise **Search quality** to balanced so the search ranks on a
+mesh that can see a 10% effect. That is much slower and it is the honest fix;
+the confirmation is the guard, not a substitute.
+
+It is worth it here: at balanced quality a 20° tail beats the 12° heuristic by
+**8.9% on Cd·A**. There is a real gain on this body — screening just cannot
+find it, because its error bars are four times the prize.
+
+Three further guards, two of which the trike actually trips:
+
+- **Split shells are rejected unsolved.** At a 21.5° tail the trike's shell
+  comes out in two pieces — the steeper tail cone stops reaching between the
+  lumps. A split shell meshes into a choked channel and returns a *flattering*
+  coefficient for a shape nobody chose: the most dangerous candidate a search
+  can meet, because the number looks fine.
+- **Shells that stop enclosing the payload are rejected unsolved.** The same
+  21.5° shell fails this too.
+- **Unconverged solves are flagged.** When a third or more of the search was
+  still oscillating, the run says so, because then the ranking is noise
+  wearing a tidy log. This is a *different* failure from the one above and
+  does not catch it: the 12° screening solve converged cleanly and was still
+  44% wrong.
 
 ### 4.3 Why only two knobs?
 

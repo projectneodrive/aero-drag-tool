@@ -356,6 +356,7 @@ def run_backend(
         message=message,
         log_excerpt=log_excerpt,
         settings=settings,
+        converged=converged,
     )
 
 

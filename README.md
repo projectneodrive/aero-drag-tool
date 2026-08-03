@@ -438,6 +438,72 @@ whole evaluation history is kept in the run file. It needs a live CFD
 backend, which is checked when you press the button rather than discovered
 half an hour into the queue.
 
+### The search mesh is not the judging mesh
+
+That "never worse than the heuristic" guarantee needs one more step to be
+worth anything, because **the loop ranks at screening quality and you read the
+answer at the run's own**. Those are different meshes, and a ranking taken on
+a coarse one only transfers to a fine one if the two agree on the order.
+
+On the sample trike they do not. Here are four shells differing only in tail
+angle, each solved at both qualities. Frontal area is constant to four decimal
+places *by construction* — the envelope cannot exceed the payload's widest
+section — so every difference below is pure Cd:
+
+| Tail | Frontal area | Cd screening | Cd·A screening | Cd balanced | Cd·A balanced |
+|---|---|---|---|---|---|
+| 9° | 0.4748 m² | 0.4850 | 0.2303 | 0.4581 | 0.2175 |
+| 12° | 0.4747 m² | **0.6629** | 0.3147 | 0.4606 | 0.2186 |
+| 16° | 0.4747 m² | **0.3860** | 0.1832 | 0.4470 | 0.2122 |
+| 20° | 0.4746 m² | 0.4097 | 0.1944 | 0.4199 | 0.1993 |
+
+Read the two Cd columns. Balanced spans **9.7%** across the whole bracket and
+moves smoothly — that is the aerodynamics, and it is a modest effect.
+Screening spans **72%** and is not even monotone: at 12° it reports 0.6629
+against balanced's 0.4606, a **44% error on a single point**.
+
+The real signal is ~10%; the measurement error is ~44%. **The search is
+fitting noise**, and its answer is close to random within the bracket — which
+is why it sometimes lands better than the heuristic and sometimes worse.
+Screening picks 16° here; balanced says 20°.
+
+The dangerous part: that 0.6629 solve **converged**. It was not oscillating,
+it did not warn, it settled confidently on a wrong number because a 26-cell
+mesh cannot resolve a long shallow afterbody. No convergence check catches
+this — only a finer mesh does.
+
+So the loop closes with a **confirmation**: it solves its own winner and the
+heuristic shell at the run's quality, keeps whichever actually wins, and says
+so. Two extra solves, outside the search budget. If the winner loses, the run
+reports `True loop — reverted`, keeps the heuristic shell, and quotes the
+margin by which the proxy was wrong.
+
+**On this payload, run the search at balanced.** The confirmation stops the
+loop handing back something worse, but it cannot manufacture a good answer
+from a noisy search — it can only refuse a bad one. Set **Search quality** to
+balanced and the loop ranks on a mesh that can actually see a 10% effect.
+There is a real gain waiting there: at balanced, 20° beats the 12° heuristic
+by 8.9% on Cd·A.
+
+Three further guards, two of which the trike trips:
+
+- **Split candidates are never flown.** At a 21.5° tail the trike's shell
+  comes out in two pieces — the steeper tail cone no longer reaches between
+  the lumps. A split shell meshes into a choked channel and returns a
+  flattering coefficient for a shape nobody chose. Rejected unsolved.
+- **Candidates that stop enclosing the payload are never flown.** The same
+  21.5° shell also fails this.
+- **Unconverged solves are flagged.** If a third or more of the search was
+  still oscillating, the run says the ranking is mostly solver noise. Note
+  this does *not* catch the case above — a converged solve on too coarse a
+  mesh is confidently wrong, and only the confirmation sees it.
+
+**Search quality** (in the shape search, or `refine_quality` in the scene)
+sets the mesh the search itself ranks on. Leave it at screening for a fast
+loop with a confirmed answer; raise it to balanced or accurate to remove the
+proxy altogether, which is much slower but is what you want when the
+confirmation keeps reverting.
+
 With the blended profile selected the loop searches a **third** parameter, the
 shoulder blend, after the two angles — see below.
 

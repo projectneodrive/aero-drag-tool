@@ -20,11 +20,47 @@ hundreds of solves; this walks the **generator's own two parameters**, where
   within a degree or two of the optimum;
 - the result is reproducible from two numbers rather than a mesh delta.
 
-The objective is Cd.A at the reference speed, screening preset, one backend.
-Ranking candidates against each other needs consistency far more than
-absolute accuracy -- the same reasoning the compare step uses -- and the
-winning shell gets its proper multi-backend, accurate solve afterwards like
-any other run.
+The objective is Cd.A at the reference speed, one backend, at the search
+quality (screening by default). Ranking candidates against each other needs
+consistency far more than absolute accuracy -- the same reasoning the compare
+step uses.
+
+Consistency is not sufficient on its own, though, and this is the trap the
+module fell into once already. A ranking taken on a coarse mesh transfers to
+a fine one only if the two *agree on the order*, and on a body whose entire
+design variable is the length of a shallow afterbody they need not: a long
+shallow tail is exactly what a coarse mesh resolves worst.
+
+Measured on the sample trike, tails of 9 / 12 / 16 / 20 degrees with the
+frontal area constant to four decimals by construction, so every difference is
+pure Cd:
+
+    screening   0.4850   0.6629   0.3860   0.4097     spread 72%
+    balanced    0.4581   0.4606   0.4470   0.4199     spread 9.7%
+
+Balanced is the aerodynamics and it is a modest effect. Screening is not even
+monotone, and at 12 degrees it is 44% high. Signal ~10%, error ~44%: the
+search is fitting noise, and its answer is near random within the bracket --
+which is why it lands better than the heuristic on some runs and worse on
+others.
+
+Note what does *not* help: that 0.6629 solve **converged**. It raised no
+warning and settled confidently on a wrong number, because a converged solve
+on an inadequate mesh is a stable wrong answer. The convergence flag catches a
+different failure and will never catch this one.
+
+So the loop closes with a confirmation: the winner and the heuristic shell are
+both solved at the run's own quality, whichever really wins is kept, and a
+revert is reported as such. Two solves, charged outside the search budget --
+the budget buys search, and a tighter one must not silently drop the check.
+That is what makes "never worse than the heuristic" a statement about the
+mesh the user reads rather than the mesh the search used.
+
+The confirmation can only *refuse* a bad answer, never manufacture a good one.
+When the search itself ranked noise, the honest fix is ``refine_quality``:
+search on the mesh you judge on. On the trike that is worth having -- at
+balanced a 20 degree tail beats the 12 degree heuristic by 8.9% on Cd.A, a
+real gain screening cannot find because its error bars are four times it.
 
 The search is golden-section passes: tail first because it dominates the
 trade, then nose with the tail held at its best, then the tail re-fitted
@@ -119,12 +155,16 @@ class Evaluation:
     # is the faceted envelope, so a blended search that finds nothing better
     # than a crease can say so in the same units.
     blend: float = 0.0
+    # Did this solve settle? An unconverged candidate still carries a number,
+    # but the ranking it takes part in is worth less than it looks.
+    converged: bool = True
 
     def to_dict(self) -> dict:
         return {
             "nose_deg": self.nose_deg,
             "tail_deg": self.tail_deg,
             "blend": self.blend,
+            "converged": self.converged,
             "drag_area": self.drag_area,
             "drag_coefficient": self.drag_coefficient,
             "frontal_area": self.frontal_area,
@@ -149,13 +189,52 @@ class RefineResult:
     nose_bracket: tuple[float, float] | None = None
     blend_bracket: tuple[float, float] | None = None
     at_bracket_edge: list[str] = field(default_factory=list)
+    # What the search ranked on, and what the winner was then checked at.
+    search_quality: str = "screening"
+    confirm_quality: str | None = None
+    confirmed_best: float | None = None
+    confirmed_baseline: float | None = None
+    # The search's winner lost at the finer mesh, so the heuristic shell was
+    # kept. Not a failure -- the loop doing exactly what it promises.
+    reverted_to_baseline: bool = False
 
     @property
     def improvement(self) -> float | None:
-        """Fractional Cd.A gain over the heuristic angles, negative is better."""
+        """Fractional Cd.A gain of the shell actually handed back.
+
+        Describes what was *delivered*, not what was considered. A reverted
+        loop delivers the heuristic shell, so its gain is exactly zero -- the
+        margin by which its own candidate lost is real information, but it
+        belongs to ``rejected_margin``, not here. Reporting the loss as the
+        outcome would say the loop made the shape worse when it did the
+        opposite.
+
+        Quoted from the confirmation solves when there are any: those are the
+        pair measured at the quality the run is read at, and a gain that only
+        exists on the search mesh is not a gain.
+        """
+        if self.reverted_to_baseline:
+            return 0.0
+        if self.confirmed_best is not None and self.confirmed_baseline:
+            return (self.confirmed_best - self.confirmed_baseline) / self.confirmed_baseline
         if not self.baseline.drag_area or not self.best.drag_area:
             return None
         return (self.best.drag_area - self.baseline.drag_area) / self.baseline.drag_area
+
+    @property
+    def rejected_margin(self) -> float | None:
+        """How badly the search's own winner lost at the confirmation quality.
+
+        Only meaningful on a revert, where it is the size of the disagreement
+        between the search mesh and the judging one -- i.e. how much the proxy
+        was worth trusting. A large value is the signal to raise the search
+        quality rather than to distrust the loop.
+        """
+        if not self.reverted_to_baseline:
+            return None
+        if self.confirmed_best is None or not self.confirmed_baseline:
+            return None
+        return (self.confirmed_best - self.confirmed_baseline) / self.confirmed_baseline
 
     def to_dict(self) -> dict:
         return {
@@ -169,6 +248,12 @@ class RefineResult:
             "nose_bracket": list(self.nose_bracket) if self.nose_bracket else None,
             "blend_bracket": list(self.blend_bracket) if self.blend_bracket else None,
             "at_bracket_edge": list(self.at_bracket_edge),
+            "search_quality": self.search_quality,
+            "confirm_quality": self.confirm_quality,
+            "confirmed_best": self.confirmed_best,
+            "confirmed_baseline": self.confirmed_baseline,
+            "reverted_to_baseline": self.reverted_to_baseline,
+            "rejected_margin": self.rejected_margin,
         }
 
 
@@ -221,13 +306,20 @@ def _at_edge(value: float, bracket: tuple[float, float], tolerance: float) -> st
     return ""
 
 
-def _screening_scene(scene: Scene, shell_mesh: trimesh.Trimesh, backend: str) -> Scene:
+def _trial_scene(
+    scene: Scene, shell_mesh: trimesh.Trimesh, backend: str, quality: str
+) -> Scene:
     """The parent run's conditions around a candidate shell, set up to rank.
 
     Same wind, road and fluid as the run that asked -- the optimum depends on
-    them -- but screening quality, one solve scaled, one backend. The loop
-    compares candidates against each other, so consistency is what matters;
-    the winner gets its accurate multi-backend solve later like any run.
+    them -- but one solve scaled and one backend, at ``quality``. The loop
+    compares candidates against each other, so consistency is what matters.
+
+    Consistency is *not* sufficient on its own, though, which is what the
+    confirmation stage downstream exists for: a ranking taken at a coarse mesh
+    only transfers to a fine one if the two agree on the order, and on a body
+    whose whole point is a long shallow tail they need not. Screening resolves
+    exactly that tail worst.
     """
     trial = scene.without_results()
     trial.geometry = Geometry.from_bytes(
@@ -235,26 +327,37 @@ def _screening_scene(scene: Scene, shell_mesh: trimesh.Trimesh, backend: str) ->
     )
     trial.payload = None
     trial.fairing = None
-    trial.solver.apply_preset("screening")
+    trial.solver.apply_preset(quality)
     trial.solver.sweep_mode = "scale"
     trial.solver.backends = [backend]
     return trial
 
 
-def _drag_area(results) -> tuple[float | None, float | None, float | None, str]:
+def _drag_area(results) -> tuple[float | None, float | None, float | None, str, bool]:
+    """Cd.A at the reference point, and whether the solve actually settled.
+
+    The convergence flag is returned rather than folded into the number
+    because an unconverged solve is not a failure -- it produced a
+    coefficient, and discarding it would leave the search with nothing on a
+    bluff body at screening iterations. It is a *ranking* hazard: two solves
+    still swinging by several percent differ by their noise as much as by
+    their shapes, so a search that cannot see the flag will happily chase it.
+    """
     for solver_run in results.runs:
         if solver_run.status != "ok":
-            return None, None, None, solver_run.message or f"{solver_run.solver} failed"
+            return None, None, None, solver_run.message or f"{solver_run.solver} failed", False
         point = solver_run.reference_point()
         if point is None:
-            return None, None, None, f"{solver_run.solver} returned no reference point"
+            return None, None, None, f"{solver_run.solver} returned no reference point", False
+        converged = bool(getattr(solver_run, "converged", True))
         return (
             point.drag_coefficient * point.frontal_area,
             point.drag_coefficient,
             point.frontal_area,
-            "",
+            "" if converged else "still oscillating at the last iteration",
+            converged,
         )
-    return None, None, None, "no solver ran"
+    return None, None, None, "no solver ran", False
 
 
 def refine_envelope(
@@ -288,6 +391,10 @@ def refine_envelope(
     best_shell: dict = {"key": None, "shell": None}
     budget = {"left": int(max_solves)}
     blended = packaging.envelope_profile == "blended"
+    # What the search ranks on, and what the answer will be read at. When they
+    # differ the ranking is a proxy, and the confirmation stage checks it.
+    search_quality = packaging.refine_quality
+    final_quality = scene.solver.quality
 
     def emit(message: str) -> None:
         if progress is not None:
@@ -337,31 +444,46 @@ def refine_envelope(
         if shell is None:
             shell = build_shell(*key)
 
-        if shell.contains_payload is False:
+        # Two ways a candidate can be disqualified before it is worth a solve,
+        # and both really happen: on the sample trike a 21.5 degree tail comes
+        # out in two pieces *and* stops enclosing the payload, because a
+        # steeper tail cone no longer reaches from one lump to the next and
+        # the merge has to be re-opened past what the grid can hold.
+        reject = ""
+        if shell.bodies > 1:
+            # A split shell meshes into a choked channel between the pieces
+            # and reports a coefficient for a shape nobody chose -- often a
+            # flattering one, since the gap is a low-pressure region the
+            # coarse screening mesh barely resolves. That is the single most
+            # dangerous candidate the search can meet: plausible number,
+            # meaningless shape.
+            reject = f"the shell came out as {shell.bodies} separate bodies"
+        elif shell.contains_payload is False:
             # The envelope is extensive by construction, so this is the
             # smoothing having eaten a tight corner. Whatever such a shell's
             # Cd.A is, it is not a number for a shape that holds the payload,
             # and letting it win would hand back a fairing the thing does not
-            # fit inside. Rank it behind every real candidate instead of
-            # spending a solve on it.
+            # fit inside.
+            reject = "the shell did not enclose the payload"
+
+        if reject:
+            # Ranked behind every real candidate rather than solved, so the
+            # search backs away from it instead of chasing it.
             evaluation = Evaluation(
-                key[0], key[1], None, None, None, time.time() - started,
-                "the shell did not enclose the payload", key[2],
+                key[0], key[1], None, None, None, time.time() - started, reject, key[2],
             )
             evaluations[key] = evaluation
             history.append(evaluation)
-            emit(
-                f"[{len(history)}/{max_solves}] {label(key)} "
-                "rejected: the shell did not enclose the payload"
-            )
+            emit(f"[{len(history)}/{max_solves}] {label(key)} rejected: {reject}")
             return evaluation
 
-        trial = _screening_scene(scene, shell.mesh, backend)
+        trial = _trial_scene(scene, shell.mesh, backend, search_quality)
         try:
             results = solve(trial, backends=[backend])
-            drag_area, cd, area, message = _drag_area(results)
+            drag_area, cd, area, message, converged = _drag_area(results)
         except Exception as error:
             drag_area, cd, area, message = None, None, None, f"{type(error).__name__}: {error}"
+            converged = False
 
         evaluation = Evaluation(
             nose_deg=key[0],
@@ -372,6 +494,7 @@ def refine_envelope(
             solve_seconds=time.time() - started,
             message=message,
             blend=key[2],
+            converged=converged,
         )
         evaluations[key] = evaluation
         history.append(evaluation)
@@ -390,7 +513,9 @@ def refine_envelope(
                 eta = f" · ≈{max(average * budget['left'] / 60.0, 1.0):.0f} min left"
             emit(
                 f"[{len(history)}/{max_solves}] {label(key)} "
-                f"→ Cd·A {drag_area:.4f} m² (best {best_now.drag_area:.4f}){eta}"
+                f"→ Cd·A {drag_area:.4f} m²"
+                + ("" if converged else " (unconverged)")
+                + f" (best {best_now.drag_area:.4f}){eta}"
             )
         else:
             emit(f"[{len(history)}/{max_solves}] {label(key)} failed: {message}")
@@ -400,6 +525,25 @@ def refine_envelope(
         # Failed solves rank behind every real number, so the search backs
         # away from whatever broke the mesher instead of chasing it.
         return evaluation.drag_area if evaluation.drag_area is not None else float("inf")
+
+    def _confirm(shell: fairing.Shell, what: str) -> float | None:
+        """Cd.A for one shell at the run's own quality, outside the budget.
+
+        Deliberately not charged to ``max_solves``: that budget buys search,
+        and this is the check on what the search returned. Charging it would
+        make a tighter budget silently drop the check.
+        """
+        execution.checkpoint()
+        trial = _trial_scene(scene, shell.mesh, backend, final_quality)
+        try:
+            drag_area, _, _, message, _ = _drag_area(solve(trial, backends=[backend]))
+        except Exception as error:
+            drag_area, message = None, f"{type(error).__name__}: {error}"
+        if drag_area is None:
+            emit(f"Confirmation solve for {what} failed: {message}")
+        else:
+            emit(f"Confirmation: {what} is Cd·A {drag_area:.4f} m² at {final_quality}.")
+        return drag_area
 
     def golden_section(low: float, high: float, run_eval, min_width: float, cap: int) -> None:
         """Shrink [low, high] around the minimum until the bracket is tight.
@@ -500,8 +644,13 @@ def refine_envelope(
     # Nose: flatter, cheaper, searched at the best tail found. It inherits
     # whatever the tail pass left unspent -- converging early is a saving, not
     # a forfeit -- minus a reserve for the passes still to come.
-    remaining_passes = 2 if blended else 1
-    reserve = min(MIN_USEFUL_PASS * remaining_passes, budget["left"] // 2)
+    #
+    # The blend is a primary parameter and reserves a full pass; the refit is
+    # a bonus and only gets what is spare. Reserving for the refit as though
+    # it were primary takes solves from the nose, which is a real design
+    # variable, to re-check one that has already been searched.
+    reserve = (MIN_USEFUL_PASS if blended else 0) + min(2, budget["left"] // 4)
+    reserve = min(reserve, max(budget["left"] - MIN_USEFUL_PASS, 0))
     golden_section(
         *nose_bracket,
         run_eval=lambda nose: evaluate(nose, tail_best, blend0),
@@ -546,6 +695,56 @@ def refine_envelope(
     best = best_so_far()
     shell = best_shell["shell"] if best_shell["shell"] is not None else baseline_shell
 
+    # ------------------------------------------------------------ confirm
+    # The search ranked candidates at `search_quality`; this shell will be
+    # read at the run's own. Those are different meshes, and a ranking taken
+    # on a coarse one transfers to a fine one only if the two agree on the
+    # order -- which, on a body whose entire design variable is the length of
+    # a shallow tail, they need not: a long shallow afterbody is precisely
+    # what a coarse mesh resolves worst. Measured on the sample trike, the
+    # orderings disagree.
+    #
+    # "The loop can never hand back something worse than the heuristic" is
+    # therefore only worth stating if it is checked at the quality it will be
+    # read at. Two solves buy that, and the fallback makes the promise true
+    # rather than merely intended.
+    confirmed_best = confirmed_baseline = None
+    reverted = False
+    changed = (best.nose_deg, best.tail_deg, best.blend) != (
+        _quantise(nose0), _quantise(tail0), _quantise_blend(blend0),
+    )
+    if changed and final_quality != search_quality:
+        emit(
+            f"Confirming at {final_quality} quality: the search ranked at "
+            f"{search_quality}, and a coarser mesh need not order a long tail "
+            "the same way a finer one does. Two solves."
+        )
+        confirmed_best = _confirm(shell, "the loop's shell")
+        confirmed_baseline = _confirm(baseline_shell, "the heuristic shell")
+        if confirmed_best is not None and confirmed_baseline is not None:
+            delta = (confirmed_best - confirmed_baseline) / confirmed_baseline
+            if confirmed_best > confirmed_baseline:
+                reverted = True
+                shell = baseline_shell
+                best = baseline
+                emit(
+                    f"At {final_quality} quality the loop's shell is "
+                    f"{delta * 100:+.1f}% on Cd·A, so the heuristic shell is kept. "
+                    f"The screening ranking did not survive the finer mesh — raise "
+                    f"'Search quality' to {final_quality} to search on the mesh you "
+                    "judge on, at the cost of a slower loop."
+                )
+            else:
+                emit(
+                    f"Confirmed at {final_quality} quality: {delta * 100:+.1f}% "
+                    "Cd·A against the heuristic shell."
+                )
+        else:
+            emit(
+                "The confirmation solves did not both succeed, so the result is "
+                f"the {search_quality} ranking only — treat it as provisional."
+            )
+
     # A winner sitting on a bracket edge means the search hit its bounds, not
     # a minimum. Say so: the honest reading is "at least this far", and the
     # user can move the starting angle and derive again to go further.
@@ -582,19 +781,55 @@ def refine_envelope(
         nose_bracket=nose_bracket,
         blend_bracket=blend_bracket,
         at_bracket_edge=edges,
+        search_quality=search_quality,
+        confirm_quality=final_quality if confirmed_best is not None else None,
+        confirmed_best=confirmed_best,
+        confirmed_baseline=confirmed_baseline,
+        reverted_to_baseline=reverted,
     )
     gain = result.improvement
-    emit(
-        f"Loop done after {result.solves} solves: tail {best.tail_deg:.1f}°, "
-        f"nose {best.nose_deg:.1f}°"
-        + (f", blend {best.blend:.2f}" if blended else "")
-        + f", Cd·A {best.drag_area:.4f} m²"
-        + (f" ({gain * 100:+.1f}% vs the heuristic angles)" if gain is not None else "")
-    )
-    if blended and best.blend <= BLEND_TOLERANCE:
+    # Quote one mesh per sentence. Mixing the search's Cd.A with a confirmed
+    # percentage reads as though both came off the same solve, which is the
+    # confusion this whole stage exists to remove.
+    if reverted:
+        margin = result.rejected_margin
+        emit(
+            f"Loop done after {result.solves} solves: keeping the heuristic shell "
+            f"(tail {best.tail_deg:.1f}°, nose {best.nose_deg:.1f}°"
+            + (f", blend {best.blend:.2f}" if blended else "")
+            + f"). Its Cd·A at {final_quality} is {confirmed_baseline:.4f} m²"
+            + (
+                f", against {confirmed_best:.4f} m² for what the {search_quality} "
+                f"search picked — {margin * 100:+.1f}%."
+                if margin is not None
+                else "."
+            )
+        )
+    else:
+        quality = result.confirm_quality or search_quality
+        value = confirmed_best if confirmed_best is not None else best.drag_area
+        emit(
+            f"Loop done after {result.solves} solves: tail {best.tail_deg:.1f}°, "
+            f"nose {best.nose_deg:.1f}°"
+            + (f", blend {best.blend:.2f}" if blended else "")
+            + f", Cd·A {value:.4f} m² at {quality}"
+            + (f" ({gain * 100:+.1f}% vs the heuristic angles)" if gain is not None else "")
+        )
+    if blended and best.blend <= BLEND_TOLERANCE and not reverted:
         emit(
             "The blend came back at zero: on this payload the faceted shoulder "
             "measured no worse than any fillet the loop tried."
+        )
+    # A search made mostly of unconverged solves has ranked noise, and the
+    # angles it reports are not measurements however tidy the log looks.
+    flown = [item for item in history if item.drag_area is not None]
+    unsettled = [item for item in flown if not item.converged]
+    if flown and len(unsettled) * 3 >= len(flown):
+        emit(
+            f"Warning: {len(unsettled)} of {len(flown)} candidates were still "
+            f"oscillating at the last iteration, so much of this ranking is "
+            f"solver noise rather than shape. Raise the iteration count, or the "
+            f"search quality above {search_quality}, before trusting these angles."
         )
     for note in edges:
         emit(

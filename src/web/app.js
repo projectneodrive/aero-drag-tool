@@ -56,6 +56,18 @@ const CONTROL_SPECS = {
         ['cfd', 'True loop — CFD in the loop, slow'],
       ],
     },
+    {
+      // The mesh the search ranks on. Screening is cheap, but its ordering
+      // only transfers to the run's own mesh if the two agree -- and on a
+      // long shallow tail they need not. The loop confirms either way; this
+      // is for removing the proxy rather than checking it.
+      key: 'refine_quality', label: 'Search quality', type: 'select',
+      options: [
+        ['screening', 'Screening — fast, confirmed after'],
+        ['balanced', 'Balanced — searches on a finer mesh'],
+        ['accurate', 'Accurate — slowest, no proxy at all'],
+      ],
+    },
     { key: 'clearance', label: 'Payload clearance', unit: 'm', min: 0.005, max: 0.3, step: 0.005, decimals: 3 },
     { key: 'anisotropy', label: 'Streamwise bias', min: 1, max: 6, step: 0.1, decimals: 1 },
     { key: 'resolution', label: 'Voxel resolution', min: 48, max: 220, step: 4, decimals: 0 },
@@ -1807,14 +1819,25 @@ function renderShell() {
     const gain = (ref.improvement === null || ref.improvement === undefined)
       ? null : ref.improvement * 100;
     const searchedBlend = ref.blend_bracket !== null && ref.blend_bracket !== undefined;
-    const refined = tile('True loop',
-      `tail ${fmt(ref.best.tail_deg, 1)}° · nose ${fmt(ref.best.nose_deg, 1)}°`
-        + (searchedBlend ? ` · blend ${fmt(ref.best.blend, 2)}` : ''),
+    // A reverted loop is the guarantee working, not the loop failing: its
+    // winner lost on the finer mesh and the heuristic shell was kept. Saying
+    // "reverted" rather than showing a gain of zero is the honest version.
+    const refined = tile(ref.reverted_to_baseline ? 'True loop — reverted' : 'True loop',
+      ref.reverted_to_baseline
+        ? 'the heuristic shell won'
+        : `tail ${fmt(ref.best.tail_deg, 1)}° · nose ${fmt(ref.best.nose_deg, 1)}°`
+          + (searchedBlend ? ` · blend ${fmt(ref.best.blend, 2)}` : ''),
       null,
-      `measured over ${ref.solves} ${ref.backend} solves`
-        + (gain === null ? '' : ` · Cd·A ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% vs the heuristic angles`)
-        + (searchedBlend && ref.best.blend <= 0 ? ' · the crease measured no worse than any fillet' : ''));
+      (ref.reverted_to_baseline
+        ? `the ${ref.search_quality} search picked tail ${fmt(ref.history.at(-1)?.tail_deg ?? 0, 1)}°, `
+          + `but at ${ref.confirm_quality} quality it measured worse — so it was not kept`
+        : `measured over ${ref.solves} ${ref.backend} solves`)
+        + (gain === null ? '' : ` · Cd·A ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}%`
+          + ` vs the heuristic${ref.confirm_quality ? ` at ${ref.confirm_quality}` : ''}`)
+        + (searchedBlend && !ref.reverted_to_baseline && ref.best.blend <= 0
+          ? ' · the crease measured no worse than any fillet' : ''));
     refined.classList.add('tile-span');
+    if (ref.reverted_to_baseline) refined.classList.add('tile-warn');
     host.append(refined);
   }
 
@@ -2037,10 +2060,18 @@ function renderActions() {
         `Solves into this run — it has no results to overwrite yet.${queueNote}`;
     }
 
+    const searchQ = run.scene.packaging?.refine_quality || 'screening';
+    const runQ = run.scene.solver?.quality || 'balanced';
     const loopNote = cfdLoop
-      ? ` Then flies ~${run.scene.packaging?.refine_solves || 10} screening solves to tune the`
+      ? ` Then flies ~${run.scene.packaging?.refine_solves || 10} ${searchQ} solves to tune the`
         + ' tail and nose angles'
         + (run.scene.packaging?.envelope_profile === 'blended' ? ' and the shoulder blend' : '')
+        // The confirmation is what stops a coarse-mesh ranking being handed
+        // back as an answer, so it belongs in the time estimate, not as a
+        // surprise at the end of the log.
+        + (searchQ !== runQ
+          ? `, then 2 more at ${runQ} to confirm the winner really beats the heuristic`
+          : '')
         + ' — minutes to an hour, watchable in the log.'
       : '';
     deriveWhy.textContent = (isShape

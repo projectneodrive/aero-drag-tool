@@ -410,6 +410,15 @@ class PackagingSettings:
     # the rule-of-thumb angles are the thing you doubt.
     shape_solver: str = "heuristic"  # or "cfd"
     refine_solves: int = 10
+    # The quality the *search* ranks candidates at. Screening is cheap and
+    # consistent, which is all a ranking needs -- provided the ordering it
+    # finds survives the finer mesh the answer is read on. It need not: a long
+    # shallow tail is exactly what a coarse mesh resolves worst, and on the
+    # sample trike the two orderings disagree. So the loop confirms its winner
+    # against the heuristic at the run's own quality and keeps whichever
+    # really wins; set this to that quality to search there directly instead,
+    # which is slower and removes the proxy altogether.
+    refine_quality: str = "screening"
 
     def to_dict(self) -> dict:
         return {
@@ -423,6 +432,7 @@ class PackagingSettings:
             "shoulder_blend": self.shoulder_blend,
             "shape_solver": self.shape_solver,
             "refine_solves": self.refine_solves,
+            "refine_quality": self.refine_quality,
         }
 
     @property
@@ -455,6 +465,11 @@ class PackagingSettings:
             shoulder_blend=_as_float(data.get("shoulder_blend"), defaults.shoulder_blend),
             shape_solver=solver,
             refine_solves=max(int(data.get("refine_solves") or defaults.refine_solves), 3),
+            refine_quality=(
+                str(data.get("refine_quality") or defaults.refine_quality)
+                if str(data.get("refine_quality") or "") in QUALITY_PRESETS
+                else defaults.refine_quality
+            ),
         )
 
 
@@ -607,6 +622,12 @@ class SolverRun:
     message: str = ""
     log_excerpt: str = ""
     settings: dict = field(default_factory=dict)
+    # Did the coefficient settle, or was it still swinging at the last
+    # iteration? An unconverged run is still "ok" -- it produced a number, and
+    # suppressing it would be worse than reporting it with a caveat -- but a
+    # search ranking candidates against each other needs to know, because two
+    # unconverged solves differ by their noise as much as by their shapes.
+    converged: bool = True
 
     def reference_point(self) -> SpeedPoint | None:
         solved = [point for point in self.points if point.source == "solved"]
@@ -622,6 +643,7 @@ class SolverRun:
             "message": self.message,
             "log_excerpt": self.log_excerpt,
             "settings": self.settings,
+            "converged": self.converged,
         }
 
     @classmethod
@@ -635,6 +657,7 @@ class SolverRun:
             message=str(data.get("message") or ""),
             log_excerpt=str(data.get("log_excerpt") or ""),
             settings=data.get("settings") or {},
+            converged=bool(data.get("converged", True)),
         )
 
 

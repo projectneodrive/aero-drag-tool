@@ -1116,6 +1116,14 @@ def derive_shape(run_id: str) -> dict:
 
             warnings = list(coarse.warnings) + list(fine.warnings)
             if refinement is not None:
+                if refinement.reverted_to_baseline:
+                    warnings.append(
+                        f"The loop's own winner measured worse than the heuristic shell at "
+                        f"{refinement.confirm_quality} quality, so the heuristic shell was kept. "
+                        f"The {refinement.search_quality} mesh the search ranks on did not order "
+                        f"these the same way. Set Search quality to {refinement.confirm_quality} "
+                        "to search on the mesh you judge on."
+                    )
                 for note in refinement.at_bracket_edge:
                     warnings.append(
                         f"The loop's best shell has {note}, so the optimum may lie past it. "

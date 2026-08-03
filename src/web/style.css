@@ -787,6 +787,9 @@ body {
 .tile-unit { font-size: 11px; font-weight: 500; color: var(--text-muted); margin-left: 3px; }
 .tile-sub { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 .tile-span { grid-column: 1 / -1; }
+/* The loop kept the heuristic shell because its own winner lost on the finer
+   mesh. Worth noticing, but it is the guarantee holding, not an error. */
+.tile-warn { border-color: var(--warn, #b8860b); }
 
 /* A run knows its parent, so its headline number can be shown as a change --
    which is the number the design loop exists to move. */
